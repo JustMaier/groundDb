@@ -1,7 +1,5 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer};
 use grounddb::Store;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 mod handlers;
 
