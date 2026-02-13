@@ -1,0 +1,12 @@
+[package]
+name = "grounddb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI interface for GroundDB"
+
+[dependencies]
+grounddb = { path = "../grounddb" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"

@@ -1,0 +1,12 @@
+[package]
+name = "grounddb-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compile-time code generation for GroundDB schemas"
+
+[dependencies]
+grounddb = { path = "../grounddb" }
+proc-macro2 = "1"
+quote = "1"
+heck = "0.5"
