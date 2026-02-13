@@ -1,0 +1,89 @@
+# schema.yaml
+
+types:
+  address:
+    street: { type: string, required: true }
+    city: { type: string, required: true }
+    state: { type: string }
+    zip: { type: string }
+
+collections:
+  users:
+    path: "users/{name}.md"
+    fields:
+      name: { type: string, required: true }
+      email: { type: string, required: true }
+      role: { type: string, enum: [admin, member, guest], default: member }
+      address: { type: address }
+    additional_properties: false
+    strict: true
+    on_delete: error
+
+  posts:
+    path: "posts/{status}/{date:YYYY-MM-DD}-{title}.md"
+    id: { on_conflict: suffix }
+    fields:
+      title: { type: string, required: true }
+      author_id: { type: ref, target: users, required: true, on_delete: cascade }
+      date: { type: date, required: true }
+      tags: { type: list, items: string }
+      status: { type: string, enum: [draft, published, archived], default: draft }
+    content: true
+    additional_properties: false
+    strict: true
+
+  comments:
+    path: "comments/{parent:type}/{parent:id}/{user:id}-{created_at:YYYY-MM-DDTHHMM}.md"
+    fields:
+      user: { type: ref, target: users, required: true, on_delete: cascade }
+      parent: { type: ref, target: [posts, comments], required: true, on_delete: cascade }
+    content: true
+
+  events:
+    path: "events/{id}.md"
+    id: { auto: ulid }
+    fields:
+      type: { type: string, required: true }
+      severity: { type: string, enum: [info, warn, error], default: info }
+      payload: { type: object }
+    additional_properties: true
+    strict: false
+
+views:
+  post_feed:
+    query: |
+      SELECT p.title, p.date, p.tags, u.name AS author_name, u.id AS author_id
+      FROM posts p
+      JOIN users u ON p.author_id = u.id
+      WHERE p.status = 'published'
+      ORDER BY p.date DESC
+      LIMIT 100
+    materialize: true
+    buffer: 2x
+
+  user_lookup:
+    query: |
+      SELECT id, name, email, role
+      FROM users
+      ORDER BY name ASC
+    materialize: true
+
+  recent_activity:
+    query: |
+      SELECT id, title, modified_at, status
+      FROM posts
+      ORDER BY modified_at DESC
+      LIMIT 50
+    materialize: true
+    buffer: 2x
+
+  post_comments:
+    type: query
+    query: |
+      SELECT c.id, c.created_at, c.content, u.name AS commenter_name
+      FROM comments c
+      JOIN users u ON c.user = u.id
+      WHERE c.parent = :post_id
+      ORDER BY c.created_at ASC
+    params:
+      post_id: { type: string }

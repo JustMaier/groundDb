@@ -1,0 +1,14 @@
+{
+  "name": "grounddb-client",
+  "version": "0.1.0",
+  "description": "Node.js CLI client for GroundDB example server",
+  "main": "grounddb-client.js",
+  "bin": {
+    "grounddb-client": "./grounddb-client.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
