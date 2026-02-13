@@ -13,7 +13,7 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
 
     // Sort collections for deterministic output
     let mut collections: Vec<_> = schema.collections.iter().collect();
-    collections.sort_by_key(|(name, _)| name.clone());
+    collections.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (collection_name, _collection_def) in &collections {
         let method_name = collection_method_name(collection_name);
@@ -35,7 +35,7 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
 
     // Sort views for deterministic output
     let mut views: Vec<_> = schema.views.iter().collect();
-    views.sort_by_key(|(name, _)| name.clone());
+    views.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (view_name, view_def) in &views {
         let method_ident = format_ident!("{}", view_name);
@@ -139,7 +139,7 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grounddb::schema::{SchemaDefinition, CollectionDefinition, ViewDefinition};
+    use grounddb::schema::{SchemaDefinition, CollectionDefinition};
     use std::collections::HashMap;
 
     #[test]
@@ -156,6 +156,7 @@ mod tests {
                 readonly: false,
                 on_delete: None,
                 id: None,
+                records: None,
             },
         );
 

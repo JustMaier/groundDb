@@ -224,7 +224,8 @@ fn generate_partial_serde_attr(field_name: &str) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grounddb::schema::{CollectionDefinition, FieldDefinition, FieldType, IdConfig};
+    use grounddb::schema::{CollectionDefinition, FieldDefinition, FieldType};
+    use std::collections::HashMap;
 
     fn make_string_field(required: bool) -> FieldDefinition {
         FieldDefinition {
@@ -253,6 +254,7 @@ mod tests {
             readonly: false,
             on_delete: None,
             id: None,
+            records: None,
         };
 
         let tokens = generate_collection_struct("users", &collection, &[]);
@@ -278,6 +280,7 @@ mod tests {
             readonly: false,
             on_delete: None,
             id: None,
+            records: None,
         };
 
         let tokens = generate_partial_struct("users", &collection, &[]);

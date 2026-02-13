@@ -28,7 +28,7 @@ pub fn generate_views(schema: &SchemaDefinition) -> TokenStream {
     let mut tokens = TokenStream::new();
 
     let mut views: Vec<_> = schema.views.iter().collect();
-    views.sort_by_key(|(name, _)| name.clone());
+    views.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (view_name, view_def) in &views {
         let row_tokens = generate_view_row_struct(view_name, &view_def.query, schema);
@@ -87,7 +87,7 @@ fn generate_view_params_struct(
     let struct_ident = format_ident!("{}", struct_name);
 
     let mut param_entries: Vec<_> = params.iter().collect();
-    param_entries.sort_by_key(|(name, _)| name.clone());
+    param_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let field_tokens: Vec<_> = param_entries
         .iter()

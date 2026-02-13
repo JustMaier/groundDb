@@ -149,6 +149,7 @@ mod tests {
                 readonly: false,
                 on_delete: None,
                 id: None,
+                records: None,
             },
         );
 
@@ -205,6 +206,7 @@ mod tests {
                 readonly: false,
                 on_delete: None,
                 id: None,
+                records: None,
             },
         );
 
