@@ -9,5 +9,6 @@ pub mod error;
 
 pub use error::{GroundDbError, Result};
 pub use schema::SchemaDefinition;
-pub use store::Store;
+pub use store::{Store, Collection};
 pub use document::Document;
+pub use view::ViewEngine;
