@@ -315,6 +315,17 @@ impl Store {
         self.update_dynamic(collection_name, id, json_data)
     }
 
+    /// Partially update a typed document. Merges partial fields into the existing document.
+    pub fn update_partial_document<T: Serialize>(
+        &self,
+        collection_name: &str,
+        id: &str,
+        partial: &T,
+    ) -> Result<()> {
+        let json_data = serde_json::to_value(partial)?;
+        self.update_partial_dynamic(collection_name, id, json_data)
+    }
+
     /// Delete a typed document.
     pub fn delete_document(&self, collection_name: &str, id: &str) -> Result<()> {
         self.delete_dynamic(collection_name, id)
@@ -392,6 +403,18 @@ impl Store {
         let col = self.collection(collection)?;
         let yaml_data = json_value_to_yaml(&data);
         col.update(id, yaml_data, None)
+    }
+
+    /// Partially update a document, merging the given fields into existing data.
+    pub fn update_partial_dynamic(
+        &self,
+        collection: &str,
+        id: &str,
+        partial_data: serde_json::Value,
+    ) -> Result<()> {
+        let col = self.collection(collection)?;
+        let yaml_data = json_value_to_yaml(&partial_data);
+        col.update_partial(id, yaml_data, None)
     }
 
     /// Delete a document by collection name and ID.
@@ -805,6 +828,35 @@ impl<'a> Collection<'a> {
 
         self.store.post_write(&self.name)?;
         Ok(())
+    }
+
+    /// Partially update a document. Merges the given partial data into the existing
+    /// document data, only overwriting fields that are present and non-null.
+    pub fn update_partial(
+        &self,
+        id: &str,
+        partial: serde_yaml::Value,
+        content: Option<&str>,
+    ) -> Result<()> {
+        // Read existing document
+        let existing = self.get(id)?;
+        let mut merged = existing.data;
+
+        // Merge partial data into existing
+        if let (Some(base_map), Some(partial_map)) =
+            (merged.as_mapping_mut(), partial.as_mapping())
+        {
+            for (key, value) in partial_map {
+                if *value != serde_yaml::Value::Null {
+                    base_map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
+        // Use the existing content if no new content was provided
+        let effective_content = content.or(existing.content.as_deref());
+
+        self.update(id, merged, effective_content)
     }
 
     /// Delete a document by ID. Enforces referential integrity.
@@ -1337,5 +1389,54 @@ collections:
 
         let report = store.validate_all().unwrap();
         assert!(report["users"]["total"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_update_partial() {
+        let (_tmp, store) = setup_test_store();
+        let users = store.collection("users").unwrap();
+
+        let data: serde_yaml::Value =
+            serde_yaml::from_str("name: Alice\nemail: alice@test.com\nrole: member").unwrap();
+        users.insert(data, None).unwrap();
+
+        // Partially update just the email
+        let partial: serde_yaml::Value =
+            serde_yaml::from_str("email: alice@newdomain.com").unwrap();
+        users.update_partial("alice", partial, None).unwrap();
+
+        let doc = users.get("alice").unwrap();
+        assert_eq!(
+            doc.data["email"],
+            serde_yaml::Value::String("alice@newdomain.com".into())
+        );
+        // Name should be unchanged
+        assert_eq!(
+            doc.data["name"],
+            serde_yaml::Value::String("Alice".into())
+        );
+        // Role should be unchanged
+        assert_eq!(
+            doc.data["role"],
+            serde_yaml::Value::String("member".into())
+        );
+    }
+
+    #[test]
+    fn test_directory_hash_updated_on_write() {
+        let (_tmp, store) = setup_test_store();
+
+        // Get initial hash for users
+        let hash_before = store.db.get_directory_hash("users").unwrap();
+
+        // Insert a document
+        let users = store.collection("users").unwrap();
+        let data: serde_yaml::Value =
+            serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap();
+        users.insert(data, None).unwrap();
+
+        // Hash should have changed
+        let hash_after = store.db.get_directory_hash("users").unwrap();
+        assert_ne!(hash_before, hash_after);
     }
 }
