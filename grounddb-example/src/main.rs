@@ -1,11 +1,14 @@
 use actix_web::{web, App, HttpServer};
 use grounddb::Store;
+use std::sync::Mutex;
 
 mod handlers;
 
-/// Shared application state
+/// Shared application state.
+/// Store is wrapped in a Mutex because rusqlite::Connection is !Sync.
+/// If Store is made Send+Sync internally in the future, the Mutex can be removed.
 pub struct AppState {
-    pub store: Store,
+    pub store: Mutex<Store>,
 }
 
 #[actix_web::main]
@@ -23,7 +26,7 @@ async fn main() -> std::io::Result<()> {
     log::info!("Opening store at: {data_dir}");
     let store = Store::open(&data_dir).expect("Failed to open GroundDB store");
 
-    let state = web::Data::new(AppState { store });
+    let state = web::Data::new(AppState { store: Mutex::new(store) });
 
     log::info!("Listening on {host}:{port}");
     HttpServer::new(move || {

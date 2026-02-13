@@ -86,7 +86,8 @@ fn err_response(e: grounddb::GroundDbError) -> HttpResponse {
 // ── Status ──────────────────────────────────────────────────────────
 
 async fn status(state: web::Data<AppState>) -> HttpResponse {
-    match state.store.status() {
+    let store = state.store.lock().unwrap();
+    match store.status() {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
@@ -94,52 +95,53 @@ async fn status(state: web::Data<AppState>) -> HttpResponse {
 
 // ── Generic CRUD handlers ───────────────────────────────────────────
 
-async fn list_collection(state: &AppState, collection: &str) -> HttpResponse {
+fn handle_list(state: &AppState, collection: &str) -> HttpResponse {
+    let store = state.store.lock().unwrap();
     let filters = HashMap::new();
-    match state.store.list_dynamic(collection, &filters) {
+    match store.list_dynamic(collection, &filters) {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
 }
 
-async fn get_document(state: &AppState, collection: &str, id: &str) -> HttpResponse {
-    match state.store.get_dynamic(collection, id) {
+fn handle_get(state: &AppState, collection: &str, id: &str) -> HttpResponse {
+    let store = state.store.lock().unwrap();
+    match store.get_dynamic(collection, id) {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
 }
 
-async fn create_document(
-    state: &AppState,
-    collection: &str,
-    body: serde_json::Value,
-) -> HttpResponse {
+fn handle_create(state: &AppState, collection: &str, body: serde_json::Value) -> HttpResponse {
+    let store = state.store.lock().unwrap();
     let content = body.get("content").and_then(|c| c.as_str()).map(|s| s.to_string());
     let mut data = body;
     // Remove "content" from the data object since it's passed separately
     if let Some(obj) = data.as_object_mut() {
         obj.remove("content");
     }
-    match state.store.insert_dynamic(collection, data, content.as_deref()) {
+    match store.insert_dynamic(collection, data, content.as_deref()) {
         Ok(id) => created_json(serde_json::json!({ "id": id })),
         Err(e) => err_response(e),
     }
 }
 
-async fn update_document(
+fn handle_update(
     state: &AppState,
     collection: &str,
     id: &str,
     body: serde_json::Value,
 ) -> HttpResponse {
-    match state.store.update_dynamic(collection, id, body) {
+    let store = state.store.lock().unwrap();
+    match store.update_dynamic(collection, id, body) {
         Ok(()) => ok_json(serde_json::json!({ "ok": true, "id": id })),
         Err(e) => err_response(e),
     }
 }
 
-async fn delete_document(state: &AppState, collection: &str, id: &str) -> HttpResponse {
-    match state.store.delete_dynamic(collection, id) {
+fn handle_delete(state: &AppState, collection: &str, id: &str) -> HttpResponse {
+    let store = state.store.lock().unwrap();
+    match store.delete_dynamic(collection, id) {
         Ok(()) => ok_json(serde_json::json!({ "ok": true, "deleted": id })),
         Err(e) => err_response(e),
     }
@@ -148,18 +150,18 @@ async fn delete_document(state: &AppState, collection: &str, id: &str) -> HttpRe
 // ── Users ───────────────────────────────────────────────────────────
 
 async fn list_users(state: web::Data<AppState>) -> HttpResponse {
-    list_collection(&state, "users").await
+    handle_list(&state, "users")
 }
 
 async fn get_user(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    get_document(&state, "users", &path).await
+    handle_get(&state, "users", &path)
 }
 
 async fn create_user(
     state: web::Data<AppState>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    create_document(&state, "users", body.into_inner()).await
+    handle_create(&state, "users", body.into_inner())
 }
 
 async fn update_user(
@@ -167,28 +169,28 @@ async fn update_user(
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    update_document(&state, "users", &path, body.into_inner()).await
+    handle_update(&state, "users", &path, body.into_inner())
 }
 
 async fn delete_user(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    delete_document(&state, "users", &path).await
+    handle_delete(&state, "users", &path)
 }
 
 // ── Posts ───────────────────────────────────────────────────────────
 
 async fn list_posts(state: web::Data<AppState>) -> HttpResponse {
-    list_collection(&state, "posts").await
+    handle_list(&state, "posts")
 }
 
 async fn get_post(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    get_document(&state, "posts", &path).await
+    handle_get(&state, "posts", &path)
 }
 
 async fn create_post(
     state: web::Data<AppState>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    create_document(&state, "posts", body.into_inner()).await
+    handle_create(&state, "posts", body.into_inner())
 }
 
 async fn update_post(
@@ -196,28 +198,28 @@ async fn update_post(
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    update_document(&state, "posts", &path, body.into_inner()).await
+    handle_update(&state, "posts", &path, body.into_inner())
 }
 
 async fn delete_post(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    delete_document(&state, "posts", &path).await
+    handle_delete(&state, "posts", &path)
 }
 
 // ── Comments ────────────────────────────────────────────────────────
 
 async fn list_comments(state: web::Data<AppState>) -> HttpResponse {
-    list_collection(&state, "comments").await
+    handle_list(&state, "comments")
 }
 
 async fn get_comment(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    get_document(&state, "comments", &path).await
+    handle_get(&state, "comments", &path)
 }
 
 async fn create_comment(
     state: web::Data<AppState>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    create_document(&state, "comments", body.into_inner()).await
+    handle_create(&state, "comments", body.into_inner())
 }
 
 async fn update_comment(
@@ -225,28 +227,28 @@ async fn update_comment(
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    update_document(&state, "comments", &path, body.into_inner()).await
+    handle_update(&state, "comments", &path, body.into_inner())
 }
 
 async fn delete_comment(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    delete_document(&state, "comments", &path).await
+    handle_delete(&state, "comments", &path)
 }
 
 // ── Events ──────────────────────────────────────────────────────────
 
 async fn list_events(state: web::Data<AppState>) -> HttpResponse {
-    list_collection(&state, "events").await
+    handle_list(&state, "events")
 }
 
 async fn get_event(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    get_document(&state, "events", &path).await
+    handle_get(&state, "events", &path)
 }
 
 async fn create_event(
     state: web::Data<AppState>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    create_document(&state, "events", body.into_inner()).await
+    handle_create(&state, "events", body.into_inner())
 }
 
 async fn update_event(
@@ -254,31 +256,34 @@ async fn update_event(
     path: web::Path<String>,
     body: web::Json<serde_json::Value>,
 ) -> HttpResponse {
-    update_document(&state, "events", &path, body.into_inner()).await
+    handle_update(&state, "events", &path, body.into_inner())
 }
 
 async fn delete_event(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    delete_document(&state, "events", &path).await
+    handle_delete(&state, "events", &path)
 }
 
 // ── Views ───────────────────────────────────────────────────────────
 
 async fn view_post_feed(state: web::Data<AppState>) -> HttpResponse {
-    match state.store.view_dynamic("post_feed") {
+    let store = state.store.lock().unwrap();
+    match store.view_dynamic("post_feed") {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
 }
 
 async fn view_user_lookup(state: web::Data<AppState>) -> HttpResponse {
-    match state.store.view_dynamic("user_lookup") {
+    let store = state.store.lock().unwrap();
+    match store.view_dynamic("user_lookup") {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
 }
 
 async fn view_recent_activity(state: web::Data<AppState>) -> HttpResponse {
-    match state.store.view_dynamic("recent_activity") {
+    let store = state.store.lock().unwrap();
+    match store.view_dynamic("recent_activity") {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }
@@ -293,9 +298,10 @@ async fn view_post_comments(
     state: web::Data<AppState>,
     query: web::Query<PostCommentsQuery>,
 ) -> HttpResponse {
+    let store = state.store.lock().unwrap();
     let mut params = HashMap::new();
     params.insert("post_id".to_string(), query.post_id.clone());
-    match state.store.query_dynamic("post_comments", &params) {
+    match store.query_dynamic("post_comments", &params) {
         Ok(v) => ok_json(v),
         Err(e) => err_response(e),
     }

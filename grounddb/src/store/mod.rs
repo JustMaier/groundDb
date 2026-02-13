@@ -7,6 +7,9 @@ use crate::schema::{
 };
 use crate::system_db::{compute_directory_hash, SystemDb};
 use crate::validation;
+use crate::view::ViewEngine;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +22,7 @@ pub struct Store {
     schema_yaml: String,
     db: SystemDb,
     path_templates: HashMap<String, PathTemplate>,
+    view_engine: ViewEngine,
 }
 
 impl Store {
@@ -54,15 +58,21 @@ impl Store {
             path_templates.insert(name.clone(), template);
         }
 
+        let view_engine = ViewEngine::new(&schema)?;
+
         let mut store = Store {
             root,
             schema,
             schema_yaml,
             db,
             path_templates,
+            view_engine,
         };
 
         store.boot()?;
+
+        // Load cached view data
+        store.view_engine.load_from_db(&store.db)?;
 
         Ok(store)
     }
@@ -225,6 +235,110 @@ impl Store {
         &self.root
     }
 
+    // ── Typed API (used by codegen-generated StoreExt) ──────────────
+
+    /// Get a typed document from a collection.
+    pub fn get_document<T: DeserializeOwned>(
+        &self,
+        collection_name: &str,
+        id: &str,
+    ) -> Result<Document<T>> {
+        let record = self
+            .db
+            .get_document(collection_name, id)?
+            .ok_or_else(|| GroundDbError::NotFound {
+                collection: collection_name.to_string(),
+                id: id.to_string(),
+            })?;
+
+        let file_path = self.root.join(&record.path);
+        let raw_doc = document::read_document(&file_path)?;
+        let data: T = serde_yaml::from_value(raw_doc.data)?;
+
+        Ok(Document {
+            id: raw_doc.id,
+            created_at: raw_doc.created_at,
+            modified_at: raw_doc.modified_at,
+            data,
+            content: raw_doc.content,
+        })
+    }
+
+    /// List all typed documents in a collection.
+    pub fn list_documents<T: DeserializeOwned>(
+        &self,
+        collection_name: &str,
+    ) -> Result<Vec<Document<T>>> {
+        let records = self.db.list_documents(collection_name)?;
+        let mut docs = Vec::new();
+
+        for record in records {
+            let file_path = self.root.join(&record.path);
+            if file_path.exists() {
+                if let Ok(raw_doc) = document::read_document(&file_path) {
+                    if let Ok(data) = serde_yaml::from_value(raw_doc.data) {
+                        docs.push(Document {
+                            id: raw_doc.id,
+                            created_at: raw_doc.created_at,
+                            modified_at: raw_doc.modified_at,
+                            data,
+                            content: raw_doc.content,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(docs)
+    }
+
+    /// Insert a new typed document. Returns the generated ID.
+    pub fn insert_document<T: Serialize>(
+        &self,
+        collection_name: &str,
+        data: &T,
+        content: Option<&str>,
+    ) -> Result<String> {
+        let json_data = serde_json::to_value(data)?;
+        self.insert_dynamic(collection_name, json_data, content)
+    }
+
+    /// Update a typed document.
+    pub fn update_document<T: Serialize>(
+        &self,
+        collection_name: &str,
+        id: &str,
+        data: &T,
+    ) -> Result<()> {
+        let json_data = serde_json::to_value(data)?;
+        self.update_dynamic(collection_name, id, json_data)
+    }
+
+    /// Delete a typed document.
+    pub fn delete_document(&self, collection_name: &str, id: &str) -> Result<()> {
+        self.delete_dynamic(collection_name, id)
+    }
+
+    /// Read a static view (no params), returning typed rows.
+    pub fn read_view<T: DeserializeOwned>(&self, view_name: &str) -> Result<Vec<T>> {
+        let json = self.view_dynamic(view_name)?;
+        let rows: Vec<T> = serde_json::from_value(json)?;
+        Ok(rows)
+    }
+
+    /// Execute a parameterized view/query, returning typed rows.
+    pub fn query_view<T: DeserializeOwned, P: Serialize>(
+        &self,
+        view_name: &str,
+        params: &P,
+    ) -> Result<Vec<T>> {
+        let params_json = serde_json::to_value(params)?;
+        let params_map = json_to_string_map(&params_json);
+        let json = self.query_dynamic(view_name, &params_map)?;
+        let rows: Vec<T> = serde_json::from_value(json)?;
+        Ok(rows)
+    }
+
     // ── Dynamic (untyped) API for CLI and HTTP server ──────────────
 
     /// Get a single document by collection name and ID.
@@ -286,18 +400,87 @@ impl Store {
     }
 
     /// Read a static view by name.
-    pub fn view_dynamic(&self, _name: &str) -> Result<serde_json::Value> {
-        // TODO: implement view engine integration
+    pub fn view_dynamic(&self, name: &str) -> Result<serde_json::Value> {
+        // Check view exists
+        if !self.schema.views.contains_key(name) {
+            return Err(GroundDbError::NotFound {
+                collection: "views".to_string(),
+                id: name.to_string(),
+            });
+        }
+
+        // Check cached data first
+        if let Some(data) = self.view_engine.get_view_data(name) {
+            return Ok(serde_json::Value::Array(data.clone()));
+        }
+
+        // Check system DB cache
+        if let Some(json_str) = self.db.get_view_data(name)? {
+            let val: serde_json::Value = serde_json::from_str(&json_str)?;
+            return Ok(val);
+        }
+
+        // No cached data — return empty for now (views are rebuilt on document changes)
         Ok(serde_json::Value::Array(vec![]))
     }
 
     /// Execute a parameterized query/view with the given parameters.
     pub fn query_dynamic(
         &self,
-        _name: &str,
-        _params: &HashMap<String, String>,
+        name: &str,
+        params: &HashMap<String, String>,
     ) -> Result<serde_json::Value> {
-        // TODO: implement view engine integration
+        // Verify the view exists in the schema
+        if !self.schema.views.contains_key(name) {
+            return Err(GroundDbError::NotFound {
+                collection: "views".to_string(),
+                id: name.to_string(),
+            });
+        }
+
+        // For parameterized queries, we evaluate against the document index
+        // Simple approach: filter documents from referenced collections using param values
+        let parsed = self.view_engine.get_view(name);
+        if let Some(parsed) = parsed {
+            // Get all documents from referenced collections
+            let mut results = Vec::new();
+            for collection_name in &parsed.referenced_collections {
+                let records = self.db.list_documents(collection_name)?;
+                for record in records {
+                    let data: serde_json::Value =
+                        serde_json::from_str(&record.data_json).unwrap_or_default();
+                    let mut row = serde_json::Map::new();
+                    row.insert("id".to_string(), serde_json::Value::String(record.id));
+
+                    // Flatten data fields
+                    if let serde_json::Value::Object(fields) = data {
+                        for (k, v) in fields {
+                            row.insert(k, v);
+                        }
+                    }
+
+                    // Check if this document matches the query params
+                    let mut matches = true;
+                    for (param_name, param_value) in params {
+                        // Check if the document has a matching field
+                        if let Some(field_val) = row.get(param_name) {
+                            if field_val.as_str() != Some(param_value) {
+                                matches = false;
+                                break;
+                            }
+                        }
+                        // Also check the WHERE clause pattern: field = :param
+                        // Simple heuristic: check if any field equals the param value
+                    }
+
+                    if matches {
+                        results.push(serde_json::Value::Object(row));
+                    }
+                }
+            }
+            return Ok(serde_json::Value::Array(results));
+        }
+
         Ok(serde_json::Value::Array(vec![]))
     }
 
@@ -774,6 +957,23 @@ fn json_value_to_yaml(json: &serde_json::Value) -> serde_yaml::Value {
             serde_yaml::Value::Mapping(m)
         }
     }
+}
+
+/// Convert a JSON value to a HashMap<String, String> for query parameters.
+fn json_to_string_map(json: &serde_json::Value) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(obj) = json.as_object() {
+        for (k, v) in obj {
+            let s = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => v.to_string(),
+            };
+            map.insert(k.clone(), s);
+        }
+    }
+    map
 }
 
 #[cfg(test)]
