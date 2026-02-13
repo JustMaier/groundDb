@@ -10,6 +10,6 @@ pub mod util;
 
 pub use error::{GroundDbError, Result};
 pub use schema::SchemaDefinition;
-pub use store::{Store, Collection};
+pub use store::{Store, Collection, Batch};
 pub use document::Document;
 pub use view::ViewEngine;

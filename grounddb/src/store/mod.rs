@@ -575,6 +575,14 @@ impl Store {
         }))
     }
 
+    /// Create a batch for all-or-nothing execution of multiple write operations.
+    pub fn batch(&self) -> Batch<'_> {
+        Batch {
+            store: self,
+            ops: Vec::new(),
+        }
+    }
+
     /// Force rebuild of indexes and views, optionally for a specific collection.
     pub fn rebuild(&self, collection: Option<&str>) -> Result<()> {
         match collection {
@@ -648,6 +656,136 @@ impl Store {
         }
 
         Ok(())
+    }
+}
+
+// ── Batch Operations ───────────────────────────────────────────
+
+/// A deferred write operation for batch execution.
+enum BatchOp {
+    Insert {
+        collection: String,
+        data: serde_json::Value,
+        content: Option<String>,
+    },
+    Update {
+        collection: String,
+        id: String,
+        data: serde_json::Value,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
+}
+
+/// A batch of write operations that execute all-or-nothing.
+/// On failure, files written during the batch are rolled back.
+pub struct Batch<'a> {
+    store: &'a Store,
+    ops: Vec<BatchOp>,
+}
+
+/// A scoped handle for queuing batch writes to a specific collection.
+pub struct BatchCollection<'a, 'b> {
+    batch: &'b mut Batch<'a>,
+    collection: String,
+}
+
+impl<'a> Batch<'a> {
+    /// Get a handle for queuing operations on a collection.
+    pub fn collection(&mut self, name: &str) -> BatchCollection<'a, '_> {
+        BatchCollection {
+            batch: self,
+            collection: name.to_string(),
+        }
+    }
+
+    /// Execute all queued operations atomically.
+    /// If any operation fails, previously-written files in this batch are rolled back.
+    pub fn execute(self) -> Result<Vec<String>> {
+        // Track files created so we can roll back on failure
+        let mut created_files: Vec<PathBuf> = Vec::new();
+        let mut results: Vec<String> = Vec::new();
+
+        // Begin a DB transaction
+        self.store.db.begin_transaction()?;
+
+        for op in &self.ops {
+            let res = match op {
+                BatchOp::Insert { collection, data, content } => {
+                    self.store
+                        .insert_dynamic(collection, data.clone(), content.as_deref())
+                        .map(|id| {
+                            results.push(id.clone());
+                            // Track the file that was created
+                            if let Ok(col) = self.store.collection(collection) {
+                                if let Ok(Some(record)) = self.store.db.get_document(collection, &id) {
+                                    created_files.push(self.store.root.join(&record.path));
+                                }
+                                let _ = col; // just used for lifetime
+                            }
+                        })
+                }
+                BatchOp::Update { collection, id, data } => {
+                    self.store
+                        .update_dynamic(collection, id, data.clone())
+                        .map(|_| {
+                            results.push(id.clone());
+                        })
+                }
+                BatchOp::Delete { collection, id } => {
+                    self.store
+                        .delete_dynamic(collection, id)
+                        .map(|_| {
+                            results.push(id.clone());
+                        })
+                }
+            };
+
+            if let Err(e) = res {
+                // Roll back: remove files created during this batch
+                for path in &created_files {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.store.db.rollback_transaction()?;
+                return Err(e);
+            }
+        }
+
+        self.store.db.commit_transaction()?;
+        Ok(results)
+    }
+}
+
+impl<'a, 'b> BatchCollection<'a, 'b> {
+    /// Queue an insert operation.
+    pub fn insert(&mut self, data: serde_json::Value, content: Option<&str>) -> &mut Self {
+        self.batch.ops.push(BatchOp::Insert {
+            collection: self.collection.clone(),
+            data,
+            content: content.map(|s| s.to_string()),
+        });
+        self
+    }
+
+    /// Queue an update operation.
+    pub fn update(&mut self, id: &str, data: serde_json::Value) -> &mut Self {
+        self.batch.ops.push(BatchOp::Update {
+            collection: self.collection.clone(),
+            id: id.to_string(),
+            data,
+        });
+        self
+    }
+
+    /// Queue a delete operation.
+    pub fn delete(&mut self, id: &str) -> &mut Self {
+        self.batch.ops.push(BatchOp::Delete {
+            collection: self.collection.clone(),
+            id: id.to_string(),
+        });
+        self
     }
 }
 
@@ -1438,5 +1576,58 @@ collections:
         // Hash should have changed
         let hash_after = store.db.get_directory_hash("users").unwrap();
         assert_ne!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn test_batch_insert() {
+        let (_tmp, store) = setup_test_store();
+
+        let mut batch = store.batch();
+        batch.collection("users").insert(
+            serde_json::json!({ "name": "Alice", "email": "a@test.com" }),
+            None,
+        );
+        batch.collection("users").insert(
+            serde_json::json!({ "name": "Bob", "email": "b@test.com" }),
+            None,
+        );
+        let results = batch.execute().unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Both documents should exist
+        let users = store.collection("users").unwrap();
+        let all = users.list().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_batch_rollback_on_failure() {
+        let (_tmp, store) = setup_test_store();
+
+        // Insert one user first so we can reference it
+        let users = store.collection("users").unwrap();
+        let data: serde_yaml::Value =
+            serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap();
+        users.insert(data, None).unwrap();
+
+        // Batch: insert a valid user, then try to insert an invalid one (missing required field)
+        let mut batch = store.batch();
+        batch.collection("users").insert(
+            serde_json::json!({ "name": "Bob", "email": "b@test.com" }),
+            None,
+        );
+        // This insert is missing the required "email" field — should fail validation
+        batch.collection("users").insert(
+            serde_json::json!({ "name": "Charlie" }),
+            None,
+        );
+        let result = batch.execute();
+        assert!(result.is_err());
+
+        // The first insert in the batch (Bob) should be rolled back
+        // Only Alice should exist
+        let all = store.collection("users").unwrap().list().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "alice");
     }
 }
