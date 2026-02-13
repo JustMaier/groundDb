@@ -2,7 +2,6 @@ use grounddb::schema::{CollectionDefinition, FieldDefinition, FieldType, SchemaD
 use heck::ToPascalCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use std::collections::HashMap;
 
 use crate::type_utils::{
     collection_struct_name, enum_type_name, field_to_rust_type, partial_struct_name,
@@ -21,7 +20,7 @@ pub fn generate_structs(schema: &SchemaDefinition) -> TokenStream {
 
     // Sort collections for deterministic output
     let mut collections: Vec<_> = schema.collections.iter().collect();
-    collections.sort_by_key(|(name, _)| name.clone());
+    collections.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (collection_name, collection_def) in &collections {
         let struct_tokens =
@@ -41,13 +40,13 @@ fn generate_reusable_types(schema: &SchemaDefinition, known_types: &[String]) ->
     let mut tokens = TokenStream::new();
 
     let mut types: Vec<_> = schema.types.iter().collect();
-    types.sort_by_key(|(name, _)| name.clone());
+    types.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (type_name, fields) in types {
         let struct_name = format_ident!("{}", type_name.to_pascal_case());
 
         let mut field_entries: Vec<_> = fields.iter().collect();
-        field_entries.sort_by_key(|(name, _)| name.clone());
+        field_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         let field_tokens: Vec<_> = field_entries
             .iter()
@@ -85,7 +84,7 @@ fn generate_collection_struct(
     );
 
     let mut fields: Vec<_> = collection_def.fields.iter().collect();
-    fields.sort_by_key(|(name, _)| name.clone());
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let field_tokens: Vec<_> = fields
         .iter()
@@ -116,7 +115,7 @@ fn generate_partial_struct(
     let partial_ident = format_ident!("{}", partial_name_str);
 
     let mut fields: Vec<_> = collection_def.fields.iter().collect();
-    fields.sort_by_key(|(name, _)| name.clone());
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let field_tokens: Vec<_> = fields
         .iter()

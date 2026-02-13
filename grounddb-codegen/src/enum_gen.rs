@@ -13,7 +13,7 @@ pub fn generate_enums(schema: &SchemaDefinition) -> TokenStream {
 
     // Sort collections for deterministic output
     let mut collections: Vec<_> = schema.collections.iter().collect();
-    collections.sort_by_key(|(name, _)| name.clone());
+    collections.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (collection_name, collection_def) in &collections {
         let enum_tokens = generate_collection_enums(collection_name, collection_def);
@@ -32,7 +32,7 @@ fn generate_collection_enums(
 
     // Sort fields for deterministic output
     let mut fields: Vec<_> = collection_def.fields.iter().collect();
-    fields.sort_by_key(|(name, _)| name.clone());
+    fields.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     for (field_name, field_def) in &fields {
         // Generate value enums for fields with enum values
