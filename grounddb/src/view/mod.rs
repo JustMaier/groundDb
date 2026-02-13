@@ -8,6 +8,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Parsed information about a SQL view query
 #[derive(Debug, Clone)]
@@ -37,10 +38,11 @@ pub struct ViewColumn {
     pub source_field: Option<String>,
 }
 
-/// The view engine maintains view state and rebuilds views from the document index
+/// The view engine maintains view state and rebuilds views from the document index.
+/// Uses Mutex on view_data so the cache can be updated from shared (&self) references.
 pub struct ViewEngine {
     views: HashMap<String, ParsedView>,
-    view_data: HashMap<String, Vec<serde_json::Value>>,
+    view_data: Mutex<HashMap<String, Vec<serde_json::Value>>>,
 }
 
 impl ViewEngine {
@@ -55,7 +57,7 @@ impl ViewEngine {
 
         Ok(ViewEngine {
             views,
-            view_data: HashMap::new(),
+            view_data: Mutex::new(HashMap::new()),
         })
     }
 
@@ -74,11 +76,12 @@ impl ViewEngine {
     }
 
     /// Load cached view data from the system database
-    pub fn load_from_db(&mut self, db: &SystemDb) -> Result<()> {
+    pub fn load_from_db(&self, db: &SystemDb) -> Result<()> {
+        let mut cache = self.view_data.lock().unwrap();
         for name in self.views.keys() {
             if let Some(json_str) = db.get_view_data(name)? {
                 let data: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
-                self.view_data.insert(name.clone(), data);
+                cache.insert(name.clone(), data);
             }
         }
         Ok(())
@@ -86,25 +89,34 @@ impl ViewEngine {
 
     /// Save view data to the system database
     pub fn save_to_db(&self, db: &SystemDb) -> Result<()> {
-        for (name, data) in &self.view_data {
+        let cache = self.view_data.lock().unwrap();
+        for (name, data) in cache.iter() {
             let json_str = serde_json::to_string(data)?;
             db.set_view_data(name, &json_str)?;
         }
         Ok(())
     }
 
-    /// Get the current data for a static view
-    pub fn get_view_data(&self, name: &str) -> Option<&Vec<serde_json::Value>> {
-        self.view_data.get(name)
+    /// Get a clone of the current data for a static view
+    pub fn get_view_data(&self, name: &str) -> Option<Vec<serde_json::Value>> {
+        let cache = self.view_data.lock().unwrap();
+        cache.get(name).cloned()
+    }
+
+    /// Update the cached data for a view
+    pub fn set_view_data(&self, name: &str, data: Vec<serde_json::Value>) {
+        let mut cache = self.view_data.lock().unwrap();
+        cache.insert(name.to_string(), data);
     }
 
     /// Materialize views to the views/ directory as YAML files
     pub fn materialize_views(&self, root: &Path) -> Result<()> {
         let views_dir = root.join("views");
+        let cache = self.view_data.lock().unwrap();
 
         for (name, parsed) in &self.views {
             if parsed.materialize {
-                if let Some(data) = self.view_data.get(name) {
+                if let Some(data) = cache.get(name) {
                     std::fs::create_dir_all(&views_dir)?;
                     let output_path = views_dir.join(format!("{name}.yaml"));
 

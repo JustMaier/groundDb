@@ -6,6 +6,7 @@ use crate::schema::{
     OnDeletePolicy, SchemaDefinition,
 };
 use crate::system_db::{compute_directory_hash, SystemDb};
+use crate::util::json_to_yaml as json_value_to_yaml;
 use crate::validation;
 use crate::view::ViewEngine;
 use serde::de::DeserializeOwned;
@@ -60,7 +61,7 @@ impl Store {
 
         let view_engine = ViewEngine::new(&schema)?;
 
-        let mut store = Store {
+        let store = Store {
             root,
             schema,
             schema_yaml,
@@ -78,7 +79,7 @@ impl Store {
     }
 
     /// Boot lifecycle: check schema, scan collections, update index
-    fn boot(&mut self) -> Result<()> {
+    fn boot(&self) -> Result<()> {
         let current_hash = hash_schema(&self.schema_yaml);
 
         // Check schema hash
@@ -411,7 +412,7 @@ impl Store {
 
         // Check cached data first
         if let Some(data) = self.view_engine.get_view_data(name) {
-            return Ok(serde_json::Value::Array(data.clone()));
+            return Ok(serde_json::Value::Array(data));
         }
 
         // Check system DB cache
@@ -558,6 +559,73 @@ impl Store {
             None => self.full_scan(),
         }
     }
+
+    /// Called after any write (insert/update/delete) to a collection.
+    /// Updates the directory hash and rebuilds affected views.
+    fn post_write(&self, collection_name: &str) -> Result<()> {
+        // Update directory hash for this collection
+        let hash = self.compute_collection_hash(collection_name)?;
+        self.db.set_directory_hash(collection_name, &hash)?;
+
+        // Rebuild affected static views
+        let affected = self.view_engine.affected_views(collection_name);
+        for view_name in affected {
+            if let Some(parsed) = self.view_engine.get_view(view_name) {
+                // Only rebuild non-query-template (static) views
+                if !parsed.is_query_template {
+                    self.rebuild_view(view_name)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rebuild a single static view by querying all documents from its referenced collections.
+    fn rebuild_view(&self, view_name: &str) -> Result<()> {
+        let parsed = match self.view_engine.get_view(view_name) {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+
+        // Gather rows from all referenced collections
+        let mut rows = Vec::new();
+        for collection_name in &parsed.referenced_collections {
+            let records = self.db.list_documents(collection_name)?;
+            for record in records {
+                let data: serde_json::Value =
+                    serde_json::from_str(&record.data_json).unwrap_or_default();
+                let mut row = serde_json::Map::new();
+                row.insert("id".to_string(), serde_json::Value::String(record.id));
+                if let serde_json::Value::Object(fields) = data {
+                    for (k, v) in fields {
+                        row.insert(k, v);
+                    }
+                }
+                rows.push(serde_json::Value::Object(row));
+            }
+        }
+
+        // Apply buffer multiplier to limit
+        let effective_limit = parsed.limit.map(|l| {
+            (l as f64 * parsed.buffer_multiplier).ceil() as usize
+        });
+        if let Some(limit) = effective_limit {
+            rows.truncate(limit);
+        }
+
+        // Update in-memory cache and persist to DB
+        let json_str = serde_json::to_string(&rows)?;
+        self.db.set_view_data(view_name, &json_str)?;
+        self.view_engine.set_view_data(view_name, rows);
+
+        // Materialize if needed
+        if parsed.materialize {
+            self.view_engine.materialize_views(&self.root)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// A handle to a collection within a store.
@@ -664,6 +732,7 @@ impl<'a> Collection<'a> {
                         .db
                         .upsert_document(&resolved_id, &self.name, &resolved, &data)?;
 
+                    self.store.post_write(&self.name)?;
                     return Ok(resolved_id);
                 }
             }
@@ -677,6 +746,7 @@ impl<'a> Collection<'a> {
             .db
             .upsert_document(&id, &self.name, &rel_path, &data)?;
 
+        self.store.post_write(&self.name)?;
         Ok(id)
     }
 
@@ -733,6 +803,7 @@ impl<'a> Collection<'a> {
             .db
             .upsert_document(id, &self.name, &new_rel_path, &data)?;
 
+        self.store.post_write(&self.name)?;
         Ok(())
     }
 
@@ -769,6 +840,7 @@ impl<'a> Collection<'a> {
         // Remove from index
         self.store.db.delete_document(&self.name, id)?;
 
+        self.store.post_write(&self.name)?;
         Ok(())
     }
 
@@ -931,33 +1003,6 @@ fn doc_to_json(doc: &Document<serde_yaml::Value>) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(obj))
 }
 
-/// Convert a serde_json::Value to serde_yaml::Value
-fn json_value_to_yaml(json: &serde_json::Value) -> serde_yaml::Value {
-    match json {
-        serde_json::Value::Null => serde_yaml::Value::Null,
-        serde_json::Value::Bool(b) => serde_yaml::Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_yaml::Value::Number(serde_yaml::Number::from(i))
-            } else if let Some(f) = n.as_f64() {
-                serde_yaml::Value::Number(serde_yaml::Number::from(f))
-            } else {
-                serde_yaml::Value::Null
-            }
-        }
-        serde_json::Value::String(s) => serde_yaml::Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            serde_yaml::Value::Sequence(arr.iter().map(json_value_to_yaml).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut m = serde_yaml::Mapping::new();
-            for (k, v) in map {
-                m.insert(serde_yaml::Value::String(k.clone()), json_value_to_yaml(v));
-            }
-            serde_yaml::Value::Mapping(m)
-        }
-    }
-}
 
 /// Convert a JSON value to a HashMap<String, String> for query parameters.
 fn json_to_string_map(json: &serde_json::Value) -> HashMap<String, String> {

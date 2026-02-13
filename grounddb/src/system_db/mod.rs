@@ -1,18 +1,21 @@
 use crate::error::{GroundDbError, Result};
+use crate::util::json_to_yaml;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// The system database that manages document index, schema state, and view cache.
+/// Uses a Mutex around the connection so Store can be Send + Sync.
 pub struct SystemDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SystemDb {
     /// Open or create the system database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        let db = SystemDb { conn };
+        let db = SystemDb { conn: Mutex::new(conn) };
         db.initialize_tables()?;
         Ok(db)
     }
@@ -20,13 +23,17 @@ impl SystemDb {
     /// Open an in-memory system database (for testing).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = SystemDb { conn };
+        let db = SystemDb { conn: Mutex::new(conn) };
         db.initialize_tables()?;
         Ok(db)
     }
 
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
     fn initialize_tables(&self) -> Result<()> {
-        self.conn.execute_batch(
+        self.conn().execute_batch(
             "
             CREATE TABLE IF NOT EXISTS schema_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +85,8 @@ impl SystemDb {
 
     /// Get the most recent schema hash.
     pub fn get_last_schema_hash(&self) -> Result<Option<String>> {
-        let result = self.conn.query_row(
+        let conn = self.conn();
+        let result = conn.query_row(
             "SELECT hash FROM schema_history ORDER BY id DESC LIMIT 1",
             [],
             |row| row.get(0),
@@ -88,7 +96,7 @@ impl SystemDb {
 
     /// Record a new schema version.
     pub fn record_schema(&self, hash: &str, yaml: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO schema_history (hash, schema_yaml) VALUES (?1, ?2)",
             params![hash, yaml],
         )?;
@@ -97,7 +105,7 @@ impl SystemDb {
 
     /// Record a migration.
     pub fn record_migration(&self, description: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT INTO migrations (description) VALUES (?1)",
             params![description],
         )?;
@@ -115,7 +123,7 @@ impl SystemDb {
         data: &serde_yaml::Value,
     ) -> Result<()> {
         let data_json = serde_json::to_string(data)?;
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO documents (id, collection, path, data_json) VALUES (?1, ?2, ?3, ?4)",
             params![id, collection, path, data_json],
         )?;
@@ -124,7 +132,8 @@ impl SystemDb {
 
     /// Get a document from the index by collection and id.
     pub fn get_document(&self, collection: &str, id: &str) -> Result<Option<DocumentRecord>> {
-        let result = self.conn.query_row(
+        let conn = self.conn();
+        let result = conn.query_row(
             "SELECT id, collection, path, data_json FROM documents WHERE collection = ?1 AND id = ?2",
             params![collection, id],
             |row| {
@@ -141,7 +150,8 @@ impl SystemDb {
 
     /// List all documents in a collection.
     pub fn list_documents(&self, collection: &str) -> Result<Vec<DocumentRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
             "SELECT id, collection, path, data_json FROM documents WHERE collection = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![collection], |row| {
@@ -162,7 +172,7 @@ impl SystemDb {
 
     /// Delete a document from the index.
     pub fn delete_document(&self, collection: &str, id: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "DELETE FROM documents WHERE collection = ?1 AND id = ?2",
             params![collection, id],
         )?;
@@ -170,17 +180,15 @@ impl SystemDb {
     }
 
     /// Find all documents that reference a given target document.
-    /// Searches the data_json column for the target ID string.
     pub fn find_references(
         &self,
         target_collection: &str,
         target_id: &str,
     ) -> Result<Vec<DocumentRecord>> {
-        // Search for any document whose data_json contains the target id as a value
-        // This is a broad search; the caller should refine by checking actual ref fields
         let pattern = format!("%\"{}\"%" , target_id);
+        let conn = self.conn();
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, collection, path, data_json FROM documents
              WHERE collection != ?1 AND data_json LIKE ?2",
         )?;
@@ -202,7 +210,7 @@ impl SystemDb {
 
     /// Delete all documents in a collection from the index.
     pub fn delete_collection_documents(&self, collection: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "DELETE FROM documents WHERE collection = ?1",
             params![collection],
         )?;
@@ -213,7 +221,8 @@ impl SystemDb {
 
     /// Get the stored directory hash for a collection.
     pub fn get_directory_hash(&self, collection: &str) -> Result<Option<String>> {
-        let result = self.conn.query_row(
+        let conn = self.conn();
+        let result = conn.query_row(
             "SELECT hash FROM directory_hashes WHERE collection = ?1",
             params![collection],
             |row| row.get(0),
@@ -223,7 +232,7 @@ impl SystemDb {
 
     /// Update the directory hash for a collection.
     pub fn set_directory_hash(&self, collection: &str, hash: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO directory_hashes (collection, hash) VALUES (?1, ?2)",
             params![collection, hash],
         )?;
@@ -234,7 +243,8 @@ impl SystemDb {
 
     /// Get cached view data.
     pub fn get_view_data(&self, view_name: &str) -> Result<Option<String>> {
-        let result = self.conn.query_row(
+        let conn = self.conn();
+        let result = conn.query_row(
             "SELECT data_json FROM view_data WHERE view_name = ?1",
             params![view_name],
             |row| row.get(0),
@@ -244,7 +254,7 @@ impl SystemDb {
 
     /// Store view data.
     pub fn set_view_data(&self, view_name: &str, data_json: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO view_data (view_name, data_json) VALUES (?1, ?2)",
             params![view_name, data_json],
         )?;
@@ -253,7 +263,8 @@ impl SystemDb {
 
     /// Get view metadata.
     pub fn get_view_metadata(&self, view_name: &str) -> Result<Option<(String, String)>> {
-        let result = self.conn.query_row(
+        let conn = self.conn();
+        let result = conn.query_row(
             "SELECT last_built, source_hashes FROM view_metadata WHERE view_name = ?1",
             params![view_name],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -268,7 +279,7 @@ impl SystemDb {
         last_built: &str,
         source_hashes: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO view_metadata (view_name, last_built, source_hashes) VALUES (?1, ?2, ?3)",
             params![view_name, last_built, source_hashes],
         )?;
@@ -277,21 +288,21 @@ impl SystemDb {
 
     // ── Transaction Support ──────────────────────────────────────────
 
-    /// Begin a transaction. Returns the connection for executing in-transaction ops.
+    /// Begin a transaction.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
+        self.conn().execute_batch("BEGIN TRANSACTION")?;
         Ok(())
     }
 
     /// Commit the current transaction.
     pub fn commit_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
+        self.conn().execute_batch("COMMIT")?;
         Ok(())
     }
 
     /// Rollback the current transaction.
     pub fn rollback_transaction(&self) -> Result<()> {
-        self.conn.execute_batch("ROLLBACK")?;
+        self.conn().execute_batch("ROLLBACK")?;
         Ok(())
     }
 
@@ -304,10 +315,8 @@ impl SystemDb {
         sql: &str,
         _params_map: &HashMap<String, String>,
     ) -> Result<Vec<serde_json::Value>> {
-        // For safety, we create a view of documents that the SQL can query against.
-        // The view engine will have already translated the SQL to work against our tables.
-        // For now, this is a simple implementation that works with the documents table directly.
-        let mut stmt = self.conn.prepare(sql)
+        let conn = self.conn();
+        let mut stmt = conn.prepare(sql)
             .map_err(|e| GroundDbError::SqlParse(format!("Failed to prepare SQL: {e}")))?;
 
         let column_count = stmt.column_count();
@@ -360,34 +369,6 @@ impl DocumentRecord {
         let json: serde_json::Value = serde_json::from_str(&self.data_json)?;
         let yaml = json_to_yaml(&json);
         Ok(yaml)
-    }
-}
-
-/// Convert a serde_json::Value to serde_yaml::Value
-fn json_to_yaml(json: &serde_json::Value) -> serde_yaml::Value {
-    match json {
-        serde_json::Value::Null => serde_yaml::Value::Null,
-        serde_json::Value::Bool(b) => serde_yaml::Value::Bool(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_yaml::Value::Number(serde_yaml::Number::from(i))
-            } else if let Some(f) = n.as_f64() {
-                serde_yaml::Value::Number(serde_yaml::Number::from(f))
-            } else {
-                serde_yaml::Value::Null
-            }
-        }
-        serde_json::Value::String(s) => serde_yaml::Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            serde_yaml::Value::Sequence(arr.iter().map(json_to_yaml).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let mut m = serde_yaml::Mapping::new();
-            for (k, v) in map {
-                m.insert(serde_yaml::Value::String(k.clone()), json_to_yaml(v));
-            }
-            serde_yaml::Value::Mapping(m)
-        }
     }
 }
 
@@ -542,7 +523,7 @@ mod tests {
 
         let different = vec![
             ("a.md".to_string(), 100u64),
-            ("b.md".to_string(), 300u64), // different mtime
+            ("b.md".to_string(), 300u64),
         ];
         let h3 = compute_directory_hash(&different);
         assert_ne!(h1, h3);

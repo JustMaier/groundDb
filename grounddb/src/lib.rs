@@ -6,6 +6,7 @@ pub mod store;
 pub mod validation;
 pub mod view;
 pub mod error;
+pub mod util;
 
 pub use error::{GroundDbError, Result};
 pub use schema::SchemaDefinition;
