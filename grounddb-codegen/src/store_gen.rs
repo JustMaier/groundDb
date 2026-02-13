@@ -23,11 +23,11 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
         let collection_name_lit = *collection_name;
 
         trait_methods.push(quote! {
-            fn #method_ident(&self) -> TypedCollection<#struct_ident>;
+            fn #method_ident(&self) -> TypedCollection<'_, #struct_ident>;
         });
 
         impl_methods.push(quote! {
-            fn #method_ident(&self) -> TypedCollection<#struct_ident> {
+            fn #method_ident(&self) -> TypedCollection<'_, #struct_ident> {
                 TypedCollection::new(self.store(), #collection_name_lit)
             }
         });
@@ -73,49 +73,44 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
 
     quote! {
         /// A typed wrapper around a grounddb collection.
-        pub struct TypedCollection<T> {
-            store: *const grounddb::Store,
+        pub struct TypedCollection<'a, T> {
+            store: &'a grounddb::Store,
             collection_name: &'static str,
             _phantom: std::marker::PhantomData<T>,
         }
 
-        impl<T> TypedCollection<T> {
-            fn new(store: &grounddb::Store, collection_name: &'static str) -> Self {
+        impl<'a, T> TypedCollection<'a, T> {
+            fn new(store: &'a grounddb::Store, collection_name: &'static str) -> Self {
                 Self {
-                    store: store as *const grounddb::Store,
+                    store,
                     collection_name,
                     _phantom: std::marker::PhantomData,
                 }
             }
         }
 
-        impl<T> TypedCollection<T>
+        impl<T> TypedCollection<'_, T>
         where
             T: serde::Serialize + serde::de::DeserializeOwned + Clone,
         {
             pub fn get(&self, id: &str) -> grounddb::Result<grounddb::Document<T>> {
-                let store = unsafe { &*self.store };
-                store.get_document(self.collection_name, id)
+                self.store.get_document(self.collection_name, id)
             }
 
             pub fn list(&self) -> grounddb::Result<Vec<grounddb::Document<T>>> {
-                let store = unsafe { &*self.store };
-                store.list_documents(self.collection_name)
+                self.store.list_documents(self.collection_name)
             }
 
             pub fn insert(&self, data: T, content: Option<&str>) -> grounddb::Result<String> {
-                let store = unsafe { &*self.store };
-                store.insert_document(self.collection_name, &data, content)
+                self.store.insert_document(self.collection_name, &data, content)
             }
 
             pub fn update(&self, id: &str, data: T) -> grounddb::Result<()> {
-                let store = unsafe { &*self.store };
-                store.update_document(self.collection_name, id, &data)
+                self.store.update_document(self.collection_name, id, &data)
             }
 
             pub fn delete(&self, id: &str) -> grounddb::Result<()> {
-                let store = unsafe { &*self.store };
-                store.delete_document(self.collection_name, id)
+                self.store.delete_document(self.collection_name, id)
             }
         }
 

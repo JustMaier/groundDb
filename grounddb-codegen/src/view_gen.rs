@@ -1,4 +1,4 @@
-use grounddb::schema::{FieldType, SchemaDefinition};
+use grounddb::schema::{FieldType, ItemType, SchemaDefinition};
 use heck::ToPascalCase;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -281,7 +281,20 @@ fn resolve_column_type(
         FieldType::Boolean => quote! { bool },
         FieldType::Date => quote! { chrono::NaiveDate },
         FieldType::Datetime => quote! { chrono::DateTime<chrono::Utc> },
-        FieldType::List => quote! { Vec<String> },
+        FieldType::List => {
+            let item_type = match &field_def.items {
+                Some(ItemType::Simple(s)) => match s.as_str() {
+                    "number" => quote! { f64 },
+                    "boolean" => quote! { bool },
+                    "date" => quote! { chrono::NaiveDate },
+                    "datetime" => quote! { chrono::DateTime<chrono::Utc> },
+                    "object" => quote! { serde_json::Value },
+                    _ => quote! { String },
+                },
+                _ => quote! { String },
+            };
+            quote! { Vec<#item_type> }
+        }
         FieldType::Object => quote! { serde_json::Value },
         FieldType::Ref => quote! { String },
         FieldType::Custom(type_name) => {
