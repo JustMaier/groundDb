@@ -13,7 +13,7 @@ keywords = ["codegen", "markdown", "schema", "build-script", "grounddb"]
 categories = ["development-tools::build-utils"]
 
 [dependencies]
-grounddb = { path = "../grounddb" }
+grounddb = { version = "1.0.0", path = "../grounddb" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "parsing"] }
