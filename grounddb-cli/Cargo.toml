@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "CLI interface for GroundDB"
+publish = false
 
 [dependencies]
 grounddb = { path = "../grounddb" }

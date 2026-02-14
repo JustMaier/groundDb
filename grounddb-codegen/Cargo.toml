@@ -3,7 +3,14 @@ name = "grounddb-codegen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "Compile-time code generation for GroundDB schemas"
+readme = "README.md"
+keywords = ["codegen", "markdown", "schema", "build-script", "grounddb"]
+categories = ["development-tools::build-utils"]
 
 [dependencies]
 grounddb = { path = "../grounddb" }

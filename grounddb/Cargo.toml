@@ -3,7 +3,14 @@ name = "grounddb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
 description = "A schema-driven data layer using Markdown files as source of truth"
+readme = "README.md"
+keywords = ["database", "markdown", "schema", "yaml", "document"]
+categories = ["database", "filesystem"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
