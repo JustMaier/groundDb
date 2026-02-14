@@ -6,4 +6,6 @@ Cargo.lock
 *~
 .env
 _system.db
+**/views/*.yaml
 node_modules/
+Claude-JSON*.json
