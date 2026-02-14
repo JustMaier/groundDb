@@ -14,11 +14,14 @@ GroundDB stores your data as plain Markdown files with YAML front matter, organi
 - **Path templates** — `posts/{status}/{date:YYYY-MM-DD}-{title}.md` maps fields to filesystem paths; files move automatically when fields change
 - **YAML front matter** — structured data in every document, validated against the schema
 - **Markdown body** — optional rich content below the front matter
-- **SQL views** — define views with SQL queries over collections, maintained incrementally from a SQLite index
+- **SQL views** — define views with SQL queries (JOIN, WHERE, ORDER BY, LIMIT) over collections; CTE-rewritten and executed against the SQLite index
+- **File watching** — monitors collection directories for external changes; updates the index and rebuilds affected views automatically
+- **Subscriptions** — register callbacks for collection changes (`on_collection_change`) or view updates (`on_view_change`) to drive reactive UIs
+- **Schema migration** — diffs old and new schemas on startup; auto-applies safe changes (new fields with defaults, new collections), blocks unsafe ones
 - **Compile-time codegen** — `grounddb-codegen` generates typed Rust structs, enums, partial-update types, and store accessors
 - **Referential integrity** — `error`, `cascade`, `nullify`, and `archive` deletion policies across collections
 - **Auto IDs** — `ulid`, `uuid`, or `nanoid` generation
-- **Batch operations** — all-or-nothing writes with rollback
+- **Batch operations** — all-or-nothing writes with full file rollback
 - **CLI** — `grounddb-cli` for humans and agents alike
 
 ## Quick Start
@@ -124,6 +127,9 @@ grounddb view post_feed                         # read a materialized view
 grounddb query post_comments --post_id my-post  # parameterized query
 grounddb validate                               # check all docs against schema
 grounddb status                                 # schema info and stats
+grounddb explain post_feed                      # show rewritten SQL for a view
+grounddb migrate --dry-run                      # preview pending schema migrations
+grounddb rebuild                                # force re-index and view rebuild
 ```
 
 ## Directory Layout

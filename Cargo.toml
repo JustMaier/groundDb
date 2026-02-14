@@ -3,7 +3,8 @@ members = [
     "grounddb",
     "grounddb-codegen",
     "grounddb-cli",
-    "grounddb-example",
+    "examples/basic-crud",
+    "examples/live-dashboard",
 ]
 resolver = "2"
 
