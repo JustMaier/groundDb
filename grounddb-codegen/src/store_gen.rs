@@ -109,6 +109,10 @@ pub fn generate_store_ext(schema: &SchemaDefinition) -> TokenStream {
                 self.store.update_document(self.collection_name, id, &data)
             }
 
+            pub fn update_partial<P: serde::Serialize>(&self, id: &str, partial: &P) -> grounddb::Result<()> {
+                self.store.update_partial_document(self.collection_name, id, partial)
+            }
+
             pub fn delete(&self, id: &str) -> grounddb::Result<()> {
                 self.store.delete_document(self.collection_name, id)
             }

@@ -6,7 +6,7 @@
 # Usage: bash tools/integration-test.sh
 #
 # Prerequisites:
-# - cargo build (grounddb-example binary available)
+# - cargo build (basic-crud binary available)
 # - Node.js 18+ installed
 #
 set -euo pipefail
@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLIENT="$PROJECT_ROOT/tools/grounddb-client/grounddb-client.js"
-SERVER_BIN="$PROJECT_ROOT/target/debug/grounddb-example"
+SERVER_BIN="$PROJECT_ROOT/target/debug/basic-crud"
 PORT=18080
 SERVER_URL="http://localhost:$PORT"
 SERVER_PID=""
@@ -32,13 +32,13 @@ trap cleanup EXIT
 
 # ── Build ────────────────────────────────────────────────────────────
 
-echo "[test] Building grounddb-example..."
-(cd "$PROJECT_ROOT" && cargo build --bin grounddb-example)
+echo "[test] Building basic-crud..."
+(cd "$PROJECT_ROOT" && cargo build --bin basic-crud)
 
 # ── Start server ─────────────────────────────────────────────────────
 
 echo "[test] Starting server on port $PORT..."
-GROUNDDB_PORT=$PORT GROUNDDB_DATA_DIR="$PROJECT_ROOT/grounddb-example/data" \
+GROUNDDB_PORT=$PORT GROUNDDB_DATA_DIR="$PROJECT_ROOT/examples/basic-crud/data" \
     "$SERVER_BIN" &
 SERVER_PID=$!
 

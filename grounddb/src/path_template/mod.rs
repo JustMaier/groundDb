@@ -1,7 +1,7 @@
 use crate::error::{GroundDbError, Result};
 use chrono::NaiveDate;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A parsed path template with segments for interpolation
 #[derive(Debug, Clone)]
@@ -152,6 +152,82 @@ impl PathTemplate {
             base[..=pos].to_string()
         } else {
             String::new()
+        }
+    }
+
+    /// Reverse of `render()` — extract field values from a relative file path
+    /// by matching it against the template segments.
+    ///
+    /// Returns `None` if the path doesn't match the template structure.
+    /// Skips `NestedField` segments (consumes the text but doesn't include
+    /// them in the result map).
+    pub fn extract(&self, path: &str) -> Option<HashMap<String, String>> {
+        let mut fields = HashMap::new();
+        let mut remaining = path;
+
+        for (i, segment) in self.segments.iter().enumerate() {
+            match segment {
+                PathSegment::Literal(lit) => {
+                    if remaining.starts_with(lit.as_str()) {
+                        remaining = &remaining[lit.len()..];
+                    } else {
+                        return None;
+                    }
+                }
+                PathSegment::Field { name, format } => {
+                    let value = self.extract_field_value(remaining, i, format.as_deref())?;
+                    remaining = &remaining[value.len()..];
+                    fields.insert(name.clone(), value);
+                }
+                PathSegment::NestedField { .. } => {
+                    let value = self.extract_field_value(remaining, i, None)?;
+                    remaining = &remaining[value.len()..];
+                    // NestedField values are not stored
+                }
+            }
+        }
+
+        if remaining.is_empty() {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
+    /// Helper: extract a single field's value from `remaining`, given the
+    /// segment index `idx` and an optional format specifier.
+    ///
+    /// For date-formatted fields, consumes exactly `format.len()` characters
+    /// (the format string length equals the rendered output length).
+    /// For plain fields, consumes text up to the next literal delimiter.
+    fn extract_field_value(&self, remaining: &str, idx: usize, format: Option<&str>) -> Option<String> {
+        // Date-formatted fields have a known fixed length
+        if let Some(fmt) = format {
+            let len = fmt.len();
+            if remaining.len() >= len {
+                return Some(remaining[..len].to_string());
+            } else {
+                return None;
+            }
+        }
+
+        // Find the next literal delimiter after this field
+        let delimiter = self.segments[idx + 1..]
+            .iter()
+            .find_map(|s| match s {
+                PathSegment::Literal(lit) => Some(lit.as_str()),
+                _ => None,
+            });
+
+        if let Some(delim) = delimiter {
+            if let Some(pos) = remaining.find(delim) {
+                Some(remaining[..pos].to_string())
+            } else {
+                None
+            }
+        } else {
+            // Last field — consume the rest
+            Some(remaining.to_string())
         }
     }
 }
@@ -607,5 +683,66 @@ mod tests {
 
         let t3 = PathTemplate::parse("{id}.md").unwrap();
         assert_eq!(t3.base_directory(), "");
+    }
+
+    #[test]
+    fn test_extract_simple() {
+        let t = PathTemplate::parse("users/{name}.md").unwrap();
+        let fields = t.extract("users/alice-chen.md").unwrap();
+        assert_eq!(fields.get("name").unwrap(), "alice-chen");
+        assert_eq!(fields.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_with_date_and_status() {
+        let t = PathTemplate::parse("posts/{status}/{date:YYYY-MM-DD}-{title}.md").unwrap();
+        let fields = t
+            .extract("posts/published/2026-02-13-quarterly-review.md")
+            .unwrap();
+        assert_eq!(fields.get("status").unwrap(), "published");
+        assert_eq!(fields.get("date").unwrap(), "2026-02-13");
+        assert_eq!(fields.get("title").unwrap(), "quarterly-review");
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn test_extract_wrong_prefix() {
+        let t = PathTemplate::parse("posts/{status}/{date:YYYY-MM-DD}-{title}.md").unwrap();
+        assert!(t.extract("users/alice-chen.md").is_none());
+    }
+
+    #[test]
+    fn test_extract_id_only() {
+        let t = PathTemplate::parse("events/{id}.md").unwrap();
+        let fields = t.extract("events/01jmcx7k9a.md").unwrap();
+        assert_eq!(fields.get("id").unwrap(), "01jmcx7k9a");
+    }
+
+    #[test]
+    fn test_extract_nested_ref_skipped() {
+        let t = PathTemplate::parse("comments/{parent:type}/{parent:id}/{user:id}-{created_at:YYYY-MM-DDTHHMM}.md").unwrap();
+        // The format YYYY-MM-DDTHHMM is 15 chars; a real rendered+slugified
+        // datetime like "2026-02-13T14:30" → format → "2026-02-13T1430" → slug → "2026-02-13t1430"
+        let fields = t
+            .extract("comments/posts/my-post/alice-2026-02-13t1430.md")
+            .unwrap();
+        // NestedField segments are not included in the result
+        assert!(!fields.contains_key("parent"));
+        assert!(!fields.contains_key("user"));
+        assert_eq!(fields.get("created_at").unwrap(), "2026-02-13t1430");
+    }
+
+    #[test]
+    fn test_extract_roundtrip() {
+        // Render a path, then extract — should get back the slugified values
+        let t = PathTemplate::parse("posts/{status}/{date:YYYY-MM-DD}-{title}.md").unwrap();
+        let data: Value = serde_yaml::from_str(
+            "title: Quarterly Review\nstatus: published\ndate: '2026-02-13'",
+        )
+        .unwrap();
+        let rendered = t.render(&data, None).unwrap();
+        let extracted = t.extract(&rendered).unwrap();
+        assert_eq!(extracted.get("status").unwrap(), "published");
+        assert_eq!(extracted.get("title").unwrap(), "quarterly-review");
     }
 }

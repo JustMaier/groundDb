@@ -33,6 +33,7 @@ impl SystemDb {
     }
 
     fn initialize_tables(&self) -> Result<()> {
+        // First create all tables, then migrate existing ones if needed
         self.conn().execute_batch(
             "
             CREATE TABLE IF NOT EXISTS schema_history (
@@ -53,6 +54,9 @@ impl SystemDb {
                 collection TEXT NOT NULL,
                 path TEXT NOT NULL,
                 data_json TEXT NOT NULL,
+                created_at TEXT,
+                modified_at TEXT,
+                content_text TEXT,
                 PRIMARY KEY (collection, id)
             );
 
@@ -78,6 +82,43 @@ impl SystemDb {
             );
             "
         )?;
+        // Migrate existing documents table: add columns if missing
+        self.migrate_documents_table()?;
+        Ok(())
+    }
+
+    /// Check if the documents table has the newer columns and add them if missing.
+    fn migrate_documents_table(&self) -> Result<()> {
+        let conn = self.conn();
+        let mut has_created_at = false;
+        let mut has_modified_at = false;
+        let mut has_content_text = false;
+
+        let mut stmt = conn.prepare("PRAGMA table_info(documents)")?;
+        let rows = stmt.query_map([], |row| {
+            let name: String = row.get(1)?;
+            Ok(name)
+        })?;
+        for row in rows {
+            match row?.as_str() {
+                "created_at" => has_created_at = true,
+                "modified_at" => has_modified_at = true,
+                "content_text" => has_content_text = true,
+                _ => {}
+            }
+        }
+        drop(stmt);
+
+        if !has_created_at {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN created_at TEXT")?;
+        }
+        if !has_modified_at {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN modified_at TEXT")?;
+        }
+        if !has_content_text {
+            conn.execute_batch("ALTER TABLE documents ADD COLUMN content_text TEXT")?;
+        }
+
         Ok(())
     }
 
@@ -88,6 +129,17 @@ impl SystemDb {
         let conn = self.conn();
         let result = conn.query_row(
             "SELECT hash FROM schema_history ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(result)
+    }
+
+    /// Get the most recent schema YAML content.
+    pub fn get_last_schema_yaml(&self) -> Result<Option<String>> {
+        let conn = self.conn();
+        let result = conn.query_row(
+            "SELECT schema_yaml FROM schema_history ORDER BY id DESC LIMIT 1",
             [],
             |row| row.get(0),
         ).optional()?;
@@ -121,11 +173,14 @@ impl SystemDb {
         collection: &str,
         path: &str,
         data: &serde_yaml::Value,
+        created_at: Option<&str>,
+        modified_at: Option<&str>,
+        content_text: Option<&str>,
     ) -> Result<()> {
         let data_json = serde_json::to_string(data)?;
         self.conn().execute(
-            "INSERT OR REPLACE INTO documents (id, collection, path, data_json) VALUES (?1, ?2, ?3, ?4)",
-            params![id, collection, path, data_json],
+            "INSERT OR REPLACE INTO documents (id, collection, path, data_json, created_at, modified_at, content_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, collection, path, data_json, created_at, modified_at, content_text],
         )?;
         Ok(())
     }
@@ -310,10 +365,12 @@ impl SystemDb {
 
     /// Execute a SQL query against the documents table, returning results as
     /// a list of JSON objects. This powers the view engine.
+    ///
+    /// `params` is a list of `(":name", value)` pairs for named parameter binding.
     pub fn query_documents_sql(
         &self,
         sql: &str,
-        _params_map: &HashMap<String, String>,
+        params_map: &HashMap<String, String>,
     ) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(sql)
@@ -324,7 +381,24 @@ impl SystemDb {
             .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
             .collect();
 
-        let rows = stmt.query_map([], |row| {
+        // Build named parameter bindings for rusqlite
+        let named_params: Vec<(String, String)> = params_map
+            .iter()
+            .map(|(k, v)| {
+                let key = if k.starts_with(':') {
+                    k.clone()
+                } else {
+                    format!(":{k}")
+                };
+                (key, v.clone())
+            })
+            .collect();
+        let param_refs: Vec<(&str, &dyn rusqlite::types::ToSql)> = named_params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v as &dyn rusqlite::types::ToSql))
+            .collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
             let mut obj = serde_json::Map::new();
             for (i, name) in column_names.iter().enumerate() {
                 let val: rusqlite::types::Value = row.get(i)?;
@@ -399,7 +473,7 @@ mod tests {
         let data: serde_yaml::Value =
             serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap();
 
-        db.upsert_document("alice-chen", "users", "users/alice-chen.md", &data)
+        db.upsert_document("alice-chen", "users", "users/alice-chen.md", &data, None, None, None)
             .unwrap();
 
         let doc = db.get_document("users", "alice-chen").unwrap().unwrap();
@@ -418,8 +492,8 @@ mod tests {
         let data1: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
         let data2: serde_yaml::Value = serde_yaml::from_str("name: Bob").unwrap();
 
-        db.upsert_document("alice", "users", "users/alice.md", &data1).unwrap();
-        db.upsert_document("bob", "users", "users/bob.md", &data2).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &data1, None, None, None).unwrap();
+        db.upsert_document("bob", "users", "users/bob.md", &data2, None, None, None).unwrap();
 
         let docs = db.list_documents("users").unwrap();
         assert_eq!(docs.len(), 2);
@@ -430,7 +504,7 @@ mod tests {
         let db = SystemDb::open_in_memory().unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
 
-        db.upsert_document("alice", "users", "users/alice.md", &data).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &data, None, None, None).unwrap();
         db.delete_document("users", "alice").unwrap();
 
         let doc = db.get_document("users", "alice").unwrap();
@@ -442,10 +516,10 @@ mod tests {
         let db = SystemDb::open_in_memory().unwrap();
 
         let data1: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
-        db.upsert_document("alice", "users", "users/alice.md", &data1).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &data1, None, None, None).unwrap();
 
         let data2: serde_yaml::Value = serde_yaml::from_str("name: Alice Updated").unwrap();
-        db.upsert_document("alice", "users", "users/alice-updated.md", &data2).unwrap();
+        db.upsert_document("alice", "users", "users/alice-updated.md", &data2, None, None, None).unwrap();
 
         let docs = db.list_documents("users").unwrap();
         assert_eq!(docs.len(), 1);
@@ -500,11 +574,11 @@ mod tests {
         let db = SystemDb::open_in_memory().unwrap();
 
         let user_data: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
-        db.upsert_document("alice", "users", "users/alice.md", &user_data).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &user_data, None, None, None).unwrap();
 
         let post_data: serde_yaml::Value =
             serde_yaml::from_str("title: Test\nauthor_id: alice").unwrap();
-        db.upsert_document("test-post", "posts", "posts/test.md", &post_data).unwrap();
+        db.upsert_document("test-post", "posts", "posts/test.md", &post_data, None, None, None).unwrap();
 
         let refs = db.find_references("users", "alice").unwrap();
         assert_eq!(refs.len(), 1);
@@ -535,7 +609,7 @@ mod tests {
 
         db.begin_transaction().unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
-        db.upsert_document("alice", "users", "users/alice.md", &data).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &data, None, None, None).unwrap();
         db.commit_transaction().unwrap();
 
         let doc = db.get_document("users", "alice").unwrap();
@@ -548,7 +622,7 @@ mod tests {
 
         db.begin_transaction().unwrap();
         let data: serde_yaml::Value = serde_yaml::from_str("name: Alice").unwrap();
-        db.upsert_document("alice", "users", "users/alice.md", &data).unwrap();
+        db.upsert_document("alice", "users", "users/alice.md", &data, None, None, None).unwrap();
         db.rollback_transaction().unwrap();
 
         let doc = db.get_document("users", "alice").unwrap();

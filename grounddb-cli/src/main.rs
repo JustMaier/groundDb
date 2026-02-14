@@ -235,33 +235,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Command::Migrate { dry_run } => {
-            // Schema migration: check if the schema has changed and report the diff.
-            // Full auto-migration (field adds, renames, path reorgs) is a future enhancement.
-            let status = store.status()?;
-            let schema_hash = status.get("schema_hash").cloned().unwrap_or_default();
-            if dry_run {
-                print_output(
-                    &serde_json::json!({
-                        "dry_run": true,
-                        "schema_hash": schema_hash,
-                        "message": "Schema migration check complete. No pending migrations detected."
-                    }),
-                    &cli.format,
-                );
-            } else {
-                // Re-open the store to trigger boot lifecycle which detects schema changes
-                drop(store);
-                let store = Store::open(&cli.data_dir)?;
-                let status = store.status()?;
-                print_output(
-                    &serde_json::json!({
-                        "ok": true,
-                        "schema_hash": status.get("schema_hash").cloned().unwrap_or_default(),
-                        "message": "Migration check complete."
-                    }),
-                    &cli.format,
-                );
-            }
+            let result = store.migrate(dry_run)?;
+            print_output(&result, &cli.format);
         }
 
         Command::Export { collection } => {
@@ -270,29 +245,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print_output(&docs, &cli.format);
         }
 
-        Command::Explain { name, params } => {
-            // Show which collections a view references and estimated scan cost
-            let status = store.status()?;
-            let collections = status
-                .get("collections")
-                .and_then(|c| c.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            let param_info: Vec<_> = params
-                .iter()
-                .map(|(k, v)| serde_json::json!({ "name": k, "value": v }))
-                .collect();
-
-            print_output(
-                &serde_json::json!({
-                    "view": name,
-                    "params": param_info,
-                    "collections_scanned": collections.keys().collect::<Vec<_>>(),
-                    "note": "View queries are evaluated against the document index in _system.db, not individual files."
-                }),
-                &cli.format,
-            );
+        Command::Explain { name, params: _ } => {
+            let result = store.explain_view(&name)?;
+            print_output(&result, &cli.format);
         }
     }
 

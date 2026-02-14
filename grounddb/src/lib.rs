@@ -44,11 +44,13 @@ pub mod system_db;
 pub mod store;
 pub mod validation;
 pub mod view;
+pub mod migration;
+pub mod watcher;
 pub mod error;
 pub mod util;
 
 pub use error::{GroundDbError, Result};
 pub use schema::SchemaDefinition;
-pub use store::{Store, Collection, Batch};
+pub use store::{Store, Collection, Batch, SubscriptionId, ChangeEvent};
 pub use document::Document;
 pub use view::ViewEngine;

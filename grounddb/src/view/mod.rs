@@ -10,12 +10,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// A reference to a table/collection in a FROM or JOIN clause, with optional alias.
+#[derive(Debug, Clone)]
+pub struct TableRef {
+    pub collection: String,
+    pub alias: Option<String>,
+}
+
 /// Parsed information about a SQL view query
 #[derive(Debug, Clone)]
 pub struct ParsedView {
     pub name: String,
-    /// Collections referenced by the query (from FROM and JOIN clauses)
-    pub referenced_collections: HashSet<String>,
+    /// The original SQL text from the schema
+    pub original_sql: String,
+    /// Table references with aliases from FROM and JOIN clauses
+    pub table_refs: Vec<TableRef>,
     /// Column aliases in the result
     pub columns: Vec<ViewColumn>,
     /// Whether the view has a LIMIT clause
@@ -28,6 +37,13 @@ pub struct ParsedView {
     pub is_query_template: bool,
     /// Parameter names for query templates
     pub param_names: Vec<String>,
+}
+
+impl ParsedView {
+    /// Get the set of collection names referenced by this view.
+    pub fn referenced_collections(&self) -> HashSet<String> {
+        self.table_refs.iter().map(|r| r.collection.clone()).collect()
+    }
 }
 
 /// A column in a view result
@@ -70,7 +86,7 @@ impl ViewEngine {
     pub fn affected_views(&self, collection: &str) -> Vec<&str> {
         self.views
             .iter()
-            .filter(|(_, v)| v.referenced_collections.contains(collection))
+            .filter(|(_, v)| v.referenced_collections().contains(collection))
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -109,32 +125,131 @@ impl ViewEngine {
         cache.insert(name.to_string(), data);
     }
 
-    /// Materialize views to the views/ directory as YAML files
-    pub fn materialize_views(&self, root: &Path) -> Result<()> {
-        let views_dir = root.join("views");
+    /// Materialize a single view to the views/ directory as a YAML file.
+    pub fn materialize_view(&self, root: &Path, view_name: &str) -> Result<()> {
+        let parsed = match self.views.get(view_name) {
+            Some(p) if p.materialize => p,
+            _ => return Ok(()),
+        };
+
         let cache = self.view_data.lock().unwrap();
+        if let Some(data) = cache.get(view_name) {
+            let views_dir = root.join("views");
+            std::fs::create_dir_all(&views_dir)?;
+            let output_path = views_dir.join(format!("{view_name}.yaml"));
 
-        for (name, parsed) in &self.views {
-            if parsed.materialize {
-                if let Some(data) = cache.get(name) {
-                    std::fs::create_dir_all(&views_dir)?;
-                    let output_path = views_dir.join(format!("{name}.yaml"));
+            // Apply limit for materialized output (buffer has more data)
+            let limited_data: Vec<&serde_json::Value> = if let Some(limit) = parsed.limit {
+                data.iter().take(limit as usize).collect()
+            } else {
+                data.iter().collect()
+            };
 
-                    // Apply limit for materialized output (buffer has more data)
-                    let limited_data: Vec<&serde_json::Value> = if let Some(limit) = parsed.limit {
-                        data.iter().take(limit as usize).collect()
-                    } else {
-                        data.iter().collect()
-                    };
-
-                    let yaml = serde_yaml::to_string(&limited_data)?;
-                    std::fs::write(&output_path, &yaml)?;
-                }
-            }
+            let yaml = serde_yaml::to_string(&limited_data)?;
+            std::fs::write(&output_path, &yaml)?;
         }
 
         Ok(())
     }
+
+    /// Materialize all materialized views to the views/ directory as YAML files.
+    pub fn materialize_views(&self, root: &Path) -> Result<()> {
+        let view_names: Vec<String> = self.views.keys().cloned().collect();
+        for name in &view_names {
+            self.materialize_view(root, name)?;
+        }
+        Ok(())
+    }
+}
+
+/// Rewritten SQL query ready for execution against the documents table.
+#[derive(Debug, Clone)]
+pub struct RewrittenQuery {
+    /// The CTE-wrapped SQL ready for rusqlite execution
+    pub sql: String,
+    /// Ordered parameter names for binding (e.g., ["post_id"])
+    pub param_names: Vec<String>,
+    /// limit * buffer_multiplier — used for buffered views
+    pub buffer_limit: Option<usize>,
+    /// The original LIMIT from the user's SQL
+    pub original_limit: Option<usize>,
+}
+
+/// Rewrite a parsed view's SQL into a CTE-wrapped query against the `documents` table.
+///
+/// For each collection referenced in the view, generates a CTE that extracts
+/// all schema-defined fields from `data_json` via `json_extract()`. The user's
+/// original SQL is appended verbatim after the CTEs.
+pub fn rewrite_view_sql(
+    parsed: &ParsedView,
+    schema: &SchemaDefinition,
+) -> Result<RewrittenQuery> {
+    let mut cte_parts = Vec::new();
+
+    for table_ref in &parsed.table_refs {
+        let collection_name = &table_ref.collection;
+        let col_def = schema.collections.get(collection_name);
+        if col_def.is_none() {
+            return Err(GroundDbError::SqlParse(format!(
+                "View '{}': referenced collection '{}' not found in schema",
+                parsed.name, collection_name
+            )));
+        }
+        let col_def = col_def.unwrap();
+
+        // Build SELECT columns for this CTE
+        let mut cte_columns = Vec::new();
+
+        // Implicit fields: id, created_at, modified_at are direct columns
+        cte_columns.push("id".to_string());
+        cte_columns.push("created_at".to_string());
+        cte_columns.push("modified_at".to_string());
+
+        // If collection has content: true, expose content_text as "content"
+        if col_def.content {
+            cte_columns.push("content_text AS content".to_string());
+        }
+
+        // Schema-defined fields extracted via json_extract
+        for (field_name, _field_def) in &col_def.fields {
+            cte_columns.push(format!(
+                "json_extract(data_json, '$.{field_name}') AS {field_name}"
+            ));
+        }
+
+        let columns_sql = cte_columns.join(",\n      ");
+        let cte = format!(
+            "{collection_name} AS (\n    SELECT\n      {columns_sql}\n    FROM documents\n    WHERE collection = '{collection_name}'\n  )"
+        );
+        cte_parts.push(cte);
+    }
+
+    // Build the final SQL
+    let original_sql = parsed.original_sql.trim();
+
+    let full_sql = if cte_parts.is_empty() {
+        original_sql.to_string()
+    } else {
+        format!("WITH {}\n{}", cte_parts.join(",\n  "), original_sql)
+    };
+
+    // Calculate buffer limit
+    let buffer_limit = parsed.limit.map(|l| {
+        (l as f64 * parsed.buffer_multiplier).ceil() as usize
+    });
+
+    log::debug!(
+        "View '{}' rewritten SQL:\n{}",
+        parsed.name,
+        full_sql
+    );
+
+    Ok(RewrittenQuery {
+        sql: full_sql,
+        param_names: parsed.param_names.clone(),
+        buffer_limit,
+        original_limit: parsed.limit.map(|l| l as usize),
+    })
 }
 
 /// Parse a SQL view query to extract metadata (referenced collections, columns, etc.)
@@ -154,12 +269,12 @@ fn parse_view_query(name: &str, view_def: &ViewDefinition) -> Result<ParsedView>
     }
 
     let stmt = &statements[0];
-    let mut referenced_collections = HashSet::new();
+    let mut table_refs = Vec::new();
     let mut columns = Vec::new();
     let mut limit = None;
 
     if let Statement::Query(query) = stmt {
-        extract_from_query(query, &mut referenced_collections, &mut columns, &mut limit);
+        extract_from_query(query, &mut table_refs, &mut columns, &mut limit);
     }
 
     // Parse buffer multiplier
@@ -182,7 +297,8 @@ fn parse_view_query(name: &str, view_def: &ViewDefinition) -> Result<ParsedView>
 
     Ok(ParsedView {
         name: name.to_string(),
-        referenced_collections,
+        original_sql: sql,
+        table_refs,
         columns,
         limit,
         buffer_multiplier,
@@ -224,12 +340,12 @@ fn replace_params(sql: &str) -> String {
 /// Extract metadata from a parsed SQL query
 fn extract_from_query(
     query: &Query,
-    collections: &mut HashSet<String>,
+    table_refs: &mut Vec<TableRef>,
     columns: &mut Vec<ViewColumn>,
     limit: &mut Option<u64>,
 ) {
     if let SetExpr::Select(select) = query.body.as_ref() {
-        extract_from_select(select, collections, columns);
+        extract_from_select(select, table_refs, columns);
     }
 
     // Extract LIMIT
@@ -245,12 +361,12 @@ fn extract_from_query(
 /// Extract metadata from a SELECT clause
 fn extract_from_select(
     select: &Select,
-    collections: &mut HashSet<String>,
+    table_refs: &mut Vec<TableRef>,
     columns: &mut Vec<ViewColumn>,
 ) {
     // Extract FROM tables
     for table in &select.from {
-        extract_from_table_with_joins(table, collections);
+        extract_from_table_with_joins(table, table_refs);
     }
 
     // Extract columns
@@ -287,21 +403,28 @@ fn extract_from_select(
 /// Extract table/collection names from FROM and JOIN clauses
 fn extract_from_table_with_joins(
     table_with_joins: &TableWithJoins,
-    collections: &mut HashSet<String>,
+    table_refs: &mut Vec<TableRef>,
 ) {
-    extract_table_name(&table_with_joins.relation, collections);
+    extract_table_name(&table_with_joins.relation, table_refs);
 
     for join in &table_with_joins.joins {
-        extract_table_name(&join.relation, collections);
+        extract_table_name(&join.relation, table_refs);
     }
 }
 
-/// Extract a table name from a table factor
-fn extract_table_name(factor: &TableFactor, collections: &mut HashSet<String>) {
-    if let TableFactor::Table { name, .. } = factor {
+/// Extract a table name and alias from a table factor
+fn extract_table_name(
+    factor: &TableFactor,
+    table_refs: &mut Vec<TableRef>,
+) {
+    if let TableFactor::Table { name, alias, .. } = factor {
         let table_name = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
         if !table_name.is_empty() {
-            collections.insert(table_name);
+            let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+            table_refs.push(TableRef {
+                collection: table_name,
+                alias: alias_name,
+            });
         }
     }
 }
@@ -401,8 +524,9 @@ views:
         let engine = ViewEngine::new(&schema).unwrap();
 
         let feed = engine.get_view("post_feed").unwrap();
-        assert!(feed.referenced_collections.contains("posts"));
-        assert!(feed.referenced_collections.contains("users"));
+        let feed_collections = feed.referenced_collections();
+        assert!(feed_collections.contains("posts"));
+        assert!(feed_collections.contains("users"));
         assert_eq!(feed.limit, Some(100));
         assert_eq!(feed.buffer_multiplier, 2.0);
         assert!(feed.materialize);
@@ -416,8 +540,9 @@ views:
         let engine = ViewEngine::new(&schema).unwrap();
 
         let lookup = engine.get_view("user_lookup").unwrap();
-        assert!(lookup.referenced_collections.contains("users"));
-        assert_eq!(lookup.referenced_collections.len(), 1);
+        let lookup_collections = lookup.referenced_collections();
+        assert!(lookup_collections.contains("users"));
+        assert_eq!(lookup_collections.len(), 1);
         assert!(lookup.materialize);
         assert_eq!(lookup.limit, None);
     }
@@ -454,5 +579,119 @@ views:
             cleaned,
             "SELECT * FROM posts WHERE id = NULL AND status = NULL"
         );
+    }
+
+    // ── Phase 5: rewrite_view_sql unit tests ──
+
+    #[test]
+    fn test_rewrite_simple_select() {
+        let schema = test_schema();
+        let engine = ViewEngine::new(&schema).unwrap();
+
+        let view = engine.get_view("user_lookup").unwrap();
+        let rewritten = rewrite_view_sql(view, &schema).unwrap();
+
+        // Should contain a CTE for users
+        assert!(rewritten.sql.contains("WITH users AS"));
+        // Should contain json_extract for schema fields
+        assert!(rewritten.sql.contains("json_extract(data_json, '$.name') AS name"));
+        assert!(rewritten.sql.contains("json_extract(data_json, '$.email') AS email"));
+        assert!(rewritten.sql.contains("json_extract(data_json, '$.role') AS role"));
+        // Should contain the WHERE collection filter
+        assert!(rewritten.sql.contains("WHERE collection = 'users'"));
+        // Should contain implicit fields
+        assert!(rewritten.sql.contains("id"));
+        assert!(rewritten.sql.contains("created_at"));
+        assert!(rewritten.sql.contains("modified_at"));
+        // No buffer since no limit
+        assert!(rewritten.buffer_limit.is_none());
+        assert!(rewritten.original_limit.is_none());
+    }
+
+    #[test]
+    fn test_rewrite_join_query() {
+        let schema = test_schema();
+        let engine = ViewEngine::new(&schema).unwrap();
+
+        let view = engine.get_view("post_feed").unwrap();
+        let rewritten = rewrite_view_sql(view, &schema).unwrap();
+
+        // Should contain CTEs for both posts and users
+        assert!(rewritten.sql.contains("posts AS"));
+        assert!(rewritten.sql.contains("users AS"));
+        // Should contain the original SQL after CTEs
+        assert!(rewritten.sql.contains("JOIN"));
+        assert!(rewritten.sql.contains("p.author_id = u.id"));
+        assert!(rewritten.sql.contains("p.status = 'published'"));
+        assert!(rewritten.sql.contains("ORDER BY p.date DESC"));
+        // Buffer should be 200 (100 * 2x)
+        assert_eq!(rewritten.buffer_limit, Some(200));
+        assert_eq!(rewritten.original_limit, Some(100));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_implicit_fields() {
+        let schema = test_schema();
+        let engine = ViewEngine::new(&schema).unwrap();
+
+        let view = engine.get_view("user_lookup").unwrap();
+        let rewritten = rewrite_view_sql(view, &schema).unwrap();
+
+        // id, created_at, modified_at should be direct columns (not json_extract)
+        let cte_start = rewritten.sql.find("users AS").unwrap();
+        let cte_section = &rewritten.sql[cte_start..];
+        // These should appear as direct column references, not via json_extract
+        assert!(!cte_section.contains("json_extract(data_json, '$.id')"));
+        assert!(!cte_section.contains("json_extract(data_json, '$.created_at')"));
+    }
+
+    #[test]
+    fn test_rewrite_content_collection() {
+        let schema = test_schema();
+        let engine = ViewEngine::new(&schema).unwrap();
+
+        let view = engine.get_view("post_feed").unwrap();
+        let rewritten = rewrite_view_sql(view, &schema).unwrap();
+
+        // Posts have content: true, so should expose content_text AS content
+        let posts_cte_start = rewritten.sql.find("posts AS").unwrap();
+        let posts_section = &rewritten.sql[posts_cte_start..];
+        assert!(posts_section.contains("content_text AS content"));
+    }
+
+    #[test]
+    fn test_rewrite_parameterized_query() {
+        let schema = test_schema();
+        let engine = ViewEngine::new(&schema).unwrap();
+
+        let view = engine.get_view("post_comments").unwrap();
+        let rewritten = rewrite_view_sql(view, &schema).unwrap();
+
+        // Should contain the :post_id parameter in the SQL
+        assert!(rewritten.sql.contains(":post_id"));
+        assert!(rewritten.param_names.contains(&"post_id".to_string()));
+    }
+
+    #[test]
+    fn test_rewrite_unknown_collection_errors() {
+        let schema = test_schema();
+
+        let parsed = ParsedView {
+            name: "bad_view".to_string(),
+            original_sql: "SELECT * FROM nonexistent".to_string(),
+            table_refs: vec![TableRef {
+                collection: "nonexistent".to_string(),
+                alias: None,
+            }],
+            columns: vec![],
+            limit: None,
+            buffer_multiplier: 1.0,
+            materialize: false,
+            is_query_template: false,
+            param_names: vec![],
+        };
+
+        let result = rewrite_view_sql(&parsed, &schema);
+        assert!(result.is_err());
     }
 }
