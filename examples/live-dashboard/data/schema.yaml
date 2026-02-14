@@ -1,0 +1,43 @@
+# schema.yaml — live-dashboard example
+
+collections:
+  users:
+    path: "users/{name}.md"
+    fields:
+      name: { type: string, required: true }
+      email: { type: string, required: true }
+      role: { type: string, enum: [admin, member, guest], default: member }
+    additional_properties: false
+    strict: true
+    on_delete: error
+
+  posts:
+    path: "posts/{status}/{date:YYYY-MM-DD}-{title}.md"
+    id: { on_conflict: suffix }
+    fields:
+      title: { type: string, required: true }
+      author_id: { type: ref, target: users, required: true, on_delete: cascade }
+      date: { type: date, required: true }
+      tags: { type: list, items: string }
+      status: { type: string, enum: [draft, published, archived], default: draft }
+    content: true
+    additional_properties: false
+    strict: true
+
+views:
+  post_feed:
+    query: |
+      SELECT p.title, p.date, p.tags, u.name AS author_name, u.id AS author_id
+      FROM posts p
+      JOIN users u ON p.author_id = u.id
+      WHERE p.status = 'published'
+      ORDER BY p.date DESC
+      LIMIT 100
+    materialize: true
+
+  user_lookup:
+    query: |
+      SELECT id, name, email, role
+      FROM users
+      ORDER BY name ASC
+    materialize: true
