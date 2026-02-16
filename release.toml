@@ -1,0 +1,12 @@
+# All crates share the workspace version
+shared-version = true
+
+# Only create one tag for the whole workspace
+consolidate-commits = true
+
+# Tag format matches what our CI release workflow triggers on
+tag-name = "v{{version}}"
+
+# Automatically update version strings in dependent crates
+# (e.g., grounddb-codegen's `grounddb = { version = "1.0.0", ... }`)
+dependent-version = "upgrade"
