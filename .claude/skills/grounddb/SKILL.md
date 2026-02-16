@@ -21,15 +21,15 @@ grounddb --help
 If not installed, download the pre-built binary for your platform from the
 [latest GitHub release](https://github.com/JustMaier/groundDb/releases/latest):
 
-| Platform | Binary |
-|---|---|
-| Linux x86_64 | `grounddb-linux-amd64` |
-| macOS x86_64 | `grounddb-macos-amd64` |
-| macOS ARM (Apple Silicon) | `grounddb-macos-arm64` |
-| Windows x86_64 | `grounddb-windows-amd64.exe` |
+| Platform | Archive | Binary inside |
+|---|---|---|
+| Linux x86_64 | `grounddb-linux-amd64.tar.gz` | `grounddb-linux-amd64` |
+| macOS x86_64 | `grounddb-macos-amd64.tar.gz` | `grounddb-macos-amd64` |
+| macOS ARM (Apple Silicon) | `grounddb-macos-arm64.tar.gz` | `grounddb-macos-arm64` |
+| Windows x86_64 | `grounddb-windows-amd64.zip` | `grounddb-windows-amd64.exe` |
 
-Download the binary, rename it to `grounddb` (or `grounddb.exe` on Windows), make it
-executable (`chmod +x grounddb` on Unix), and place it on your PATH.
+Extract the archive, rename the binary to `grounddb` (or `grounddb.exe` on Windows),
+make it executable (`chmod +x grounddb` on Unix), and place it on your PATH.
 
 Alternatively, build from source with `cargo install --path grounddb-cli` from the repository.
 

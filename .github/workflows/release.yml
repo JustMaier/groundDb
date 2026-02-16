@@ -20,18 +20,22 @@ jobs:
             target: x86_64-unknown-linux-gnu
             name: grounddb-linux-amd64
             artifact: grounddb-linux-amd64
+            archive: grounddb-linux-amd64.tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin
             name: grounddb-macos-amd64
             artifact: grounddb-macos-amd64
+            archive: grounddb-macos-amd64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             name: grounddb-macos-arm64
             artifact: grounddb-macos-arm64
+            archive: grounddb-macos-arm64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: grounddb-windows-amd64.exe
             artifact: grounddb-windows-amd64
+            archive: grounddb-windows-amd64.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -44,19 +48,23 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p grounddb-cli
 
-      - name: Rename binary (unix)
+      - name: Package (unix)
         if: runner.os != 'Windows'
-        run: mv target/${{ matrix.target }}/release/grounddb-cli ${{ matrix.name }}
+        run: |
+          mv target/${{ matrix.target }}/release/grounddb-cli ${{ matrix.name }}
+          tar czf ${{ matrix.archive }} ${{ matrix.name }}
 
-      - name: Rename binary (windows)
+      - name: Package (windows)
         if: runner.os == 'Windows'
-        run: mv target/${{ matrix.target }}/release/grounddb-cli.exe ${{ matrix.name }}
+        run: |
+          mv target/${{ matrix.target }}/release/grounddb-cli.exe ${{ matrix.name }}
+          7z a ${{ matrix.archive }} ${{ matrix.name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
 
   release:
     name: Create Release
@@ -68,13 +76,13 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect binaries
+      - name: Collect archives
         run: |
           mkdir release
-          cp artifacts/grounddb-linux-amd64/grounddb-linux-amd64 release/
-          cp artifacts/grounddb-macos-amd64/grounddb-macos-amd64 release/
-          cp artifacts/grounddb-macos-arm64/grounddb-macos-arm64 release/
-          cp artifacts/grounddb-windows-amd64/grounddb-windows-amd64.exe release/
+          cp artifacts/grounddb-linux-amd64/*.tar.gz release/
+          cp artifacts/grounddb-macos-amd64/*.tar.gz release/
+          cp artifacts/grounddb-macos-arm64/*.tar.gz release/
+          cp artifacts/grounddb-windows-amd64/*.zip release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
