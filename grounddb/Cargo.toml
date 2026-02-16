@@ -7,9 +7,9 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-description = "A schema-driven data layer using Markdown files as source of truth"
+description = "Schema-driven database that stores data as Markdown files — SQL views, file watching, typed Rust codegen"
 readme = "README.md"
-keywords = ["database", "markdown", "schema", "yaml", "document"]
+keywords = ["database", "markdown", "schema", "flat-file", "document-store"]
 categories = ["database", "filesystem"]
 
 [dependencies]

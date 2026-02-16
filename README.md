@@ -4,9 +4,24 @@
 [![docs.rs](https://img.shields.io/docsrs/grounddb)](https://docs.rs/grounddb)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**A schema-driven data layer that uses Markdown files as the source of truth.**
+**A schema-driven database that stores data as Markdown files.** Define your schema in YAML, get SQL views, file watching, and fully typed Rust structs — all backed by plain Markdown files you can read, edit, and version with Git.
 
-GroundDB stores your data as plain Markdown files with YAML front matter, organized on disk by path templates you define. A SQLite index keeps queries fast, SQL-defined views stay up to date automatically, and compile-time codegen gives you fully typed Rust structs.
+## Why Markdown as a Database?
+
+Most databases lock your data behind binary formats and query languages. GroundDB takes a different approach: **your data lives as Markdown files on disk** — human-readable, git-diffable, and editable with any text editor.
+
+A SQLite index keeps queries fast. SQL-defined views stay in sync automatically. Compile-time codegen gives you typed Rust structs. You get the developer experience of a real database with the transparency and portability of flat files.
+
+**Built for AI agents too** — the CLI and Markdown format make GroundDB data fully accessible to AI coding agents without custom tooling.
+
+### What makes GroundDB different
+
+- **Human-readable storage** — every record is a Markdown file with YAML front matter, not a binary blob
+- **Git-friendly** — diff, branch, merge, and review data changes like code
+- **Schema-validated** — catch errors before they hit your data, with automatic migrations for schema changes
+- **SQL-powered queries** — define views with JOIN, WHERE, ORDER BY over your Markdown collections
+- **Type-safe Rust** — compile-time codegen means missing a required field is a build error, not a runtime crash
+- **Agent-ready** — ships with a CLI and a Claude Code skill file so AI agents can work with your data out of the box
 
 ## Features
 
@@ -109,6 +124,15 @@ fn main() -> grounddb::Result<()> {
 }
 ```
 
+## Use Cases
+
+- **Content management** — blog posts, documentation, knowledge bases stored as Markdown you can edit anywhere
+- **Configuration & settings** — schema-validated config files with automatic migration when your schema evolves
+- **AI agent data layer** — give agents structured read/write access to data they can also read as plain text
+- **Prototyping** — stand up a typed, queryable data layer in minutes without a database server
+- **Static site generators** — power your build with queryable, validated Markdown content
+- **Local-first apps** — file-based storage that works offline and syncs through Git or any file sync tool
+
 ## CLI
 
 Download a pre-built binary from the [latest release](https://github.com/JustMaier/groundDb/releases/latest), or build from source:
@@ -161,7 +185,12 @@ If you prefer to set things up yourself:
 
 The CLI outputs YAML by default or JSON with `--format json` for easy parsing.
 
-## Directory Layout
+---
+
+<details>
+<summary><strong>Technical Reference</strong></summary>
+
+### Directory Layout
 
 ```
 my-app-data/
@@ -179,7 +208,7 @@ my-app-data/
     post_feed.yaml
 ```
 
-## Document Format
+### Document Format
 
 Data-only document:
 
@@ -207,9 +236,11 @@ status: published
 The team shipped 14 features this quarter...
 ```
 
-## Specification
+### Specification
 
 See the full specification at [`docs/grounddb-spec-v1.md`](docs/grounddb-spec-v1.md).
+
+</details>
 
 ## License
 
