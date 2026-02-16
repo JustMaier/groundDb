@@ -134,10 +134,29 @@ grounddb rebuild                                # force re-index and view rebuil
 
 ## AI Agents
 
-GroundDB is designed to be agent-friendly. If you're an AI agent (or setting one up to work with GroundDB data):
+GroundDB is built to be used by AI agents. One prompt is all it takes to get your agent set up.
+
+### Give your agent this prompt
+
+```
+Read the GroundDB skill file at https://raw.githubusercontent.com/JustMaier/groundDb/main/.claude/skills/grounddb/SKILL.md — it has everything you need. Download the CLI binary for your platform, then copy the skill into this project's .claude/skills/grounddb/SKILL.md so you have it as a reference going forward.
+```
+
+That's it. The skill file tells your agent how to download the CLI, use every command, understand the schema format, and work with documents. Once installed, Claude Code will automatically surface it whenever your agent works with GroundDB data.
+
+### What the agent gets
+
+- **CLI download links** for every platform (Linux, macOS Intel/ARM, Windows)
+- **Full command reference** — insert, update, delete, list, views, queries, validation
+- **Schema and document format** guide
+- **Auto-permissioned tool access** — the skill pre-authorizes `grounddb` CLI commands so the agent can work without interruptions
+
+### Manual setup
+
+If you prefer to set things up yourself:
 
 1. **Get the CLI** — download the `grounddb` binary for your platform from the [latest release](https://github.com/JustMaier/groundDb/releases/latest)
-2. **Install the Claude Code skill** — copy [`.claude/skills/grounddb/`](.claude/skills/grounddb/) into your project's `.claude/skills/` directory for automatic CLI guidance
+2. **Install the skill** — copy [`.claude/skills/grounddb/`](.claude/skills/grounddb/) into your project's `.claude/skills/` directory
 3. **Read the schema** — run `grounddb status --data-dir <path>` or read `schema.yaml` directly to understand the data model
 
 The CLI outputs YAML by default or JSON with `--format json` for easy parsing.
