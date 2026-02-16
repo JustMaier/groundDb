@@ -111,7 +111,7 @@ fn main() -> grounddb::Result<()> {
 
 ## CLI
 
-Install the CLI from the workspace:
+Download a pre-built binary from the [latest release](https://github.com/JustMaier/groundDb/releases/latest), or build from source:
 
 ```sh
 cargo install --path grounddb-cli
@@ -119,18 +119,28 @@ cargo install --path grounddb-cli
 
 ```sh
 grounddb get users alice-chen                   # get a document
-grounddb list posts --status published          # list with path filters
-grounddb insert users --name "Bob" --email bob@example.com
-grounddb update posts my-post --status published
+grounddb list posts --filter status=published   # list with path filters
+grounddb insert users --field name="Bob" --field email=bob@example.com
+grounddb update posts my-post --field status=published
 grounddb delete users alice-chen
 grounddb view post_feed                         # read a materialized view
-grounddb query post_comments --post_id my-post  # parameterized query
+grounddb query post_comments --param post_id=my-post  # parameterized query
 grounddb validate                               # check all docs against schema
 grounddb status                                 # schema info and stats
 grounddb explain post_feed                      # show rewritten SQL for a view
 grounddb migrate --dry-run                      # preview pending schema migrations
 grounddb rebuild                                # force re-index and view rebuild
 ```
+
+## AI Agents
+
+GroundDB is designed to be agent-friendly. If you're an AI agent (or setting one up to work with GroundDB data):
+
+1. **Get the CLI** — download the `grounddb` binary for your platform from the [latest release](https://github.com/JustMaier/groundDb/releases/latest)
+2. **Install the Claude Code skill** — copy [`.claude/skills/grounddb/`](.claude/skills/grounddb/) into your project's `.claude/skills/` directory for automatic CLI guidance
+3. **Read the schema** — run `grounddb status --data-dir <path>` or read `schema.yaml` directly to understand the data model
+
+The CLI outputs YAML by default or JSON with `--format json` for easy parsing.
 
 ## Directory Layout
 
