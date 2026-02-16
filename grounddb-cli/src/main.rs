@@ -268,9 +268,11 @@ fn print_output(value: &serde_json::Value, format: &OutputFormat) {
 fn fields_to_value(fields: &[(String, String)]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (key, val) in fields {
-        // Try to parse as JSON value (for numbers, booleans, arrays, objects)
-        let json_val = serde_json::from_str(val).unwrap_or(serde_json::Value::String(val.clone()));
-        map.insert(key.clone(), json_val);
+        // Parse as YAML (superset of JSON — handles numbers, booleans, lists, objects,
+        // and bare strings naturally). Convert to serde_json::Value for the store API.
+        let parsed: serde_json::Value = serde_yaml::from_str(val)
+            .unwrap_or(serde_json::Value::String(val.clone()));
+        map.insert(key.clone(), parsed);
     }
     serde_json::Value::Object(map)
 }
