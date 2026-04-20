@@ -464,9 +464,9 @@ impl Store {
     /// Get a dynamic collection handle (uses serde_yaml::Value as the data type)
     pub fn collection(&self, name: &str) -> Result<Collection<'_>> {
         if !self.schema.collections.contains_key(name) {
-            return Err(GroundDbError::Other(format!(
-                "Collection '{name}' not found in schema"
-            )));
+            return Err(GroundDbError::CollectionNotFound {
+                name: name.to_string(),
+            });
         }
         Ok(Collection {
             store: self,
@@ -713,9 +713,8 @@ impl Store {
     pub fn view_dynamic(&self, name: &str) -> Result<serde_json::Value> {
         // Check view exists
         if !self.schema.views.contains_key(name) {
-            return Err(GroundDbError::NotFound {
-                collection: "views".to_string(),
-                id: name.to_string(),
+            return Err(GroundDbError::ViewNotFound {
+                name: name.to_string(),
             });
         }
 
@@ -742,9 +741,8 @@ impl Store {
     ) -> Result<serde_json::Value> {
         // Verify the view exists in the schema
         if !self.schema.views.contains_key(name) {
-            return Err(GroundDbError::NotFound {
-                collection: "views".to_string(),
-                id: name.to_string(),
+            return Err(GroundDbError::ViewNotFound {
+                name: name.to_string(),
             });
         }
 
@@ -2959,5 +2957,32 @@ views:
         // File should not have been rewritten since name already matches
         let after_content = std::fs::read_to_string(&user_path).unwrap();
         assert_eq!(original_content, after_content, "File should not be rewritten when path already matches YAML");
+    }
+
+    #[test]
+    fn unknown_collection_returns_typed_variant() {
+        let (_tmp, store) = setup_test_store();
+        let err = store.collection("ghosts").err().expect("expected error");
+        match err {
+            GroundDbError::CollectionNotFound { name } => assert_eq!(name, "ghosts"),
+            _ => panic!("expected CollectionNotFound"),
+        }
+    }
+
+    #[test]
+    fn unknown_view_returns_typed_variant() {
+        let (_tmp, store) = setup_test_store();
+        let err = store.view_dynamic("nonexistent_view").err().expect("expected error");
+        match err {
+            GroundDbError::ViewNotFound { name } => assert_eq!(name, "nonexistent_view"),
+            _ => panic!("expected ViewNotFound from view_dynamic"),
+        }
+
+        let params = HashMap::new();
+        let err = store.query_dynamic("nonexistent_view", &params).err().expect("expected error");
+        match err {
+            GroundDbError::ViewNotFound { name } => assert_eq!(name, "nonexistent_view"),
+            _ => panic!("expected ViewNotFound from query_dynamic"),
+        }
     }
 }
