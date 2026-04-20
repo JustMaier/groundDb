@@ -659,9 +659,22 @@ impl Store {
         id: &str,
         data: serde_json::Value,
     ) -> Result<()> {
+        self.update_dynamic_with_content(collection, id, data, None)
+    }
+
+    /// Update an existing document's fields and/or markdown content. When
+    /// `content` is `None`, the existing content is preserved; pass
+    /// `Some("")` to explicitly clear it.
+    pub fn update_dynamic_with_content(
+        &self,
+        collection: &str,
+        id: &str,
+        data: serde_json::Value,
+        content: Option<&str>,
+    ) -> Result<()> {
         let col = self.collection(collection)?;
         let yaml_data = json_value_to_yaml(&data);
-        col.update(id, yaml_data, None)
+        col.update(id, yaml_data, content)
     }
 
     /// Partially update a document, merging the given fields into existing data.
@@ -671,9 +684,23 @@ impl Store {
         id: &str,
         partial_data: serde_json::Value,
     ) -> Result<()> {
+        self.update_partial_dynamic_with_content(collection, id, partial_data, None)
+    }
+
+    /// Partially update a document (field merge) and optionally replace the
+    /// markdown content. When `content` is `None`, the existing content is
+    /// preserved. Pass an empty mapping for `partial_data` to update only
+    /// the content.
+    pub fn update_partial_dynamic_with_content(
+        &self,
+        collection: &str,
+        id: &str,
+        partial_data: serde_json::Value,
+        content: Option<&str>,
+    ) -> Result<()> {
         let col = self.collection(collection)?;
         let yaml_data = json_value_to_yaml(&partial_data);
-        col.update_partial(id, yaml_data, None)
+        col.update_partial(id, yaml_data, content)
     }
 
     /// Delete a document by collection name and ID.
