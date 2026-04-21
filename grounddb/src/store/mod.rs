@@ -687,6 +687,47 @@ impl Store {
         self.update_partial_dynamic_with_content(collection, id, partial_data, None)
     }
 
+    /// Insert many documents into a single collection atomically.
+    ///
+    /// All inserts succeed or all are rolled back. Returns the new doc
+    /// IDs in the order the items were supplied. On error, any files
+    /// written up to the failure point are removed and the index is
+    /// rolled back via the existing `Batch` machinery.
+    pub fn insert_many_dynamic(
+        &self,
+        collection: &str,
+        items: Vec<(serde_json::Value, Option<String>)>,
+    ) -> Result<Vec<String>> {
+        let mut batch = self.batch();
+        {
+            let mut handle = batch.collection(collection);
+            for (data, content) in items {
+                handle.insert(data, content.as_deref());
+            }
+        }
+        batch.execute()
+    }
+
+    /// Update many documents in a single collection atomically.
+    ///
+    /// All updates succeed or all are rolled back. Each tuple is
+    /// `(id, data)` where `data` is a full-document replacement
+    /// (same semantics as `update_dynamic`).
+    pub fn update_many_dynamic(
+        &self,
+        collection: &str,
+        items: Vec<(String, serde_json::Value)>,
+    ) -> Result<Vec<String>> {
+        let mut batch = self.batch();
+        {
+            let mut handle = batch.collection(collection);
+            for (id, data) in items {
+                handle.update(&id, data);
+            }
+        }
+        batch.execute()
+    }
+
     /// Set a single field on an existing document.
     ///
     /// Convenience wrapper around `update_partial_dynamic` for the common
@@ -3052,6 +3093,85 @@ views:
             GroundDbError::CollectionNotFound { name } => assert_eq!(name, "ghosts"),
             _ => panic!("expected CollectionNotFound"),
         }
+    }
+
+    #[test]
+    fn insert_many_dynamic_inserts_all_and_returns_ids() {
+        let (_tmp, store) = setup_test_store();
+
+        let items = vec![
+            (serde_json::json!({"name": "Alice", "email": "a@x.com"}), None),
+            (serde_json::json!({"name": "Bob", "email": "b@x.com"}), None),
+            (serde_json::json!({"name": "Carol", "email": "c@x.com"}), None),
+        ];
+        let ids = store.insert_many_dynamic("users", items).unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids, vec!["alice", "bob", "carol"]);
+
+        for id in &ids {
+            assert!(store.get_dynamic("users", id).is_ok());
+        }
+    }
+
+    #[test]
+    fn insert_many_dynamic_rolls_back_on_failure() {
+        let (tmp, store) = setup_test_store();
+
+        // Seed a user so the duplicate below forces a conflict.
+        store
+            .insert_dynamic(
+                "users",
+                serde_json::json!({"name": "Alice", "email": "a@x.com"}),
+                None,
+            )
+            .unwrap();
+
+        // Second batch tries to insert Bob, Alice (duplicate → boom),
+        // Carol. Bob's file must NOT survive the rollback.
+        let items = vec![
+            (serde_json::json!({"name": "Bob", "email": "b@x.com"}), None),
+            (serde_json::json!({"name": "Alice", "email": "dup@x.com"}), None),
+            (serde_json::json!({"name": "Carol", "email": "c@x.com"}), None),
+        ];
+        assert!(store.insert_many_dynamic("users", items).is_err());
+
+        // Bob must be gone; Alice must still have her original email.
+        assert!(store.get_dynamic("users", "bob").is_err());
+        assert!(!tmp.path().join("users/bob.md").exists());
+        let alice = store.get_dynamic("users", "alice").unwrap();
+        assert_eq!(alice["email"], serde_json::Value::String("a@x.com".into()));
+    }
+
+    #[test]
+    fn update_many_dynamic_updates_all() {
+        let (_tmp, store) = setup_test_store();
+
+        store
+            .insert_many_dynamic(
+                "users",
+                vec![
+                    (serde_json::json!({"name": "Alice", "email": "a@x.com"}), None),
+                    (serde_json::json!({"name": "Bob", "email": "b@x.com"}), None),
+                ],
+            )
+            .unwrap();
+
+        let updates = vec![
+            (
+                "alice".to_string(),
+                serde_json::json!({"name": "Alice", "email": "a@new.com", "role": "admin"}),
+            ),
+            (
+                "bob".to_string(),
+                serde_json::json!({"name": "Bob", "email": "b@new.com", "role": "admin"}),
+            ),
+        ];
+        let ids = store.update_many_dynamic("users", updates).unwrap();
+        assert_eq!(ids.len(), 2);
+
+        let alice = store.get_dynamic("users", "alice").unwrap();
+        assert_eq!(alice["role"], serde_json::Value::String("admin".into()));
+        assert_eq!(alice["email"], serde_json::Value::String("a@new.com".into()));
     }
 
     #[test]
