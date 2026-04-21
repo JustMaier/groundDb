@@ -240,6 +240,12 @@ The team shipped 14 features this quarter...
 
 See the full specification at [`docs/grounddb-spec-v1.md`](docs/grounddb-spec-v1.md).
 
+### Guides
+
+- [View Rebuild Behavior](docs/view-rebuilds.md) — when views rebuild
+  automatically, what's cached where, and how to force a rebuild after
+  schema changes.
+
 </details>
 
 ## License
