@@ -687,6 +687,23 @@ impl Store {
         self.update_partial_dynamic_with_content(collection, id, partial_data, None)
     }
 
+    /// Set a single field on an existing document.
+    ///
+    /// Convenience wrapper around `update_partial_dynamic` for the common
+    /// case of "patch exactly one field" — avoids the boilerplate of
+    /// building a one-key JSON object at the callsite.
+    pub fn patch_field(
+        &self,
+        collection: &str,
+        id: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<()> {
+        let mut patch = serde_json::Map::new();
+        patch.insert(field.to_string(), value);
+        self.update_partial_dynamic(collection, id, serde_json::Value::Object(patch))
+    }
+
     /// Partially update a document (field merge) and optionally replace the
     /// markdown content. When `content` is `None`, the existing content is
     /// preserved. Pass an empty mapping for `partial_data` to update only
@@ -2957,6 +2974,84 @@ views:
         // File should not have been rewritten since name already matches
         let after_content = std::fs::read_to_string(&user_path).unwrap();
         assert_eq!(original_content, after_content, "File should not be rewritten when path already matches YAML");
+    }
+
+    #[test]
+    fn patch_field_updates_single_field() {
+        let (_tmp, store) = setup_test_store();
+
+        // Seed: one user with role=member (default).
+        store
+            .insert_dynamic(
+                "users",
+                serde_json::json!({"name": "Alice", "email": "a@x.com"}),
+                None,
+            )
+            .unwrap();
+
+        // Patch just the role.
+        store
+            .patch_field("users", "alice", "role", serde_json::json!("admin"))
+            .unwrap();
+
+        let doc = store.get_dynamic("users", "alice").unwrap();
+        assert_eq!(doc["role"], serde_json::Value::String("admin".into()));
+        // Other fields untouched.
+        assert_eq!(doc["email"], serde_json::Value::String("a@x.com".into()));
+    }
+
+    #[test]
+    fn patch_field_preserves_content() {
+        let (_tmp, store) = setup_test_store();
+
+        store
+            .insert_dynamic(
+                "users",
+                serde_json::json!({"name": "Alice", "email": "a@x.com"}),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_dynamic(
+                "posts",
+                serde_json::json!({
+                    "title": "Hello",
+                    "author_id": "alice",
+                    "date": "2026-04-20",
+                    "status": "draft",
+                }),
+                Some("body text"),
+            )
+            .unwrap();
+
+        store
+            .patch_field(
+                "posts",
+                "2026-04-20-hello",
+                "status",
+                serde_json::json!("published"),
+            )
+            .unwrap();
+
+        let doc = store.get_dynamic("posts", "2026-04-20-hello").unwrap();
+        assert_eq!(doc["status"], serde_json::Value::String("published".into()));
+        assert_eq!(
+            doc["content"].as_str().unwrap().trim(),
+            "body text"
+        );
+    }
+
+    #[test]
+    fn patch_field_errors_when_collection_missing() {
+        let (_tmp, store) = setup_test_store();
+        let err = store
+            .patch_field("ghosts", "x", "k", serde_json::json!("v"))
+            .err()
+            .expect("expected error");
+        match err {
+            GroundDbError::CollectionNotFound { name } => assert_eq!(name, "ghosts"),
+            _ => panic!("expected CollectionNotFound"),
+        }
     }
 
     #[test]
