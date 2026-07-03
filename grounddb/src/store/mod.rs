@@ -641,7 +641,10 @@ impl Store {
         let data: T = serde_yaml::from_value(raw_doc.data)?;
 
         Ok(Document {
-            id: raw_doc.id,
+            // Use the index record's id, not the file stem: for a decorated
+            // path (`{id}-{title}.md`) the stem is not the id. The index id is
+            // authoritative (derived via id_for_path on write/reindex).
+            id: record.id,
             created_at: raw_doc.created_at,
             modified_at: raw_doc.modified_at,
             data,
@@ -663,7 +666,8 @@ impl Store {
                 if let Ok(raw_doc) = document::read_document(&file_path) {
                     if let Ok(data) = serde_yaml::from_value(raw_doc.data) {
                         docs.push(Document {
-                            id: raw_doc.id,
+                            // Index id is authoritative (see get_document).
+                            id: record.id.clone(),
                             created_at: raw_doc.created_at,
                             modified_at: raw_doc.modified_at,
                             data,
@@ -1761,7 +1765,11 @@ impl<'a> Collection<'a> {
             })?;
 
         let file_path = self.store.root.join(&record.path);
-        document::read_document(&file_path)
+        let mut doc = document::read_document(&file_path)?;
+        // The index id is authoritative; the file stem is not the id for a
+        // decorated path (`{id}-{title}.md`).
+        doc.id = record.id;
+        Ok(doc)
     }
 
     /// List all documents in this collection
@@ -1773,7 +1781,11 @@ impl<'a> Collection<'a> {
             let file_path = self.store.root.join(&record.path);
             if file_path.exists() {
                 match document::read_document(&file_path) {
-                    Ok(doc) => docs.push(doc),
+                    Ok(mut doc) => {
+                        // Index id is authoritative (see Collection::get).
+                        doc.id = record.id.clone();
+                        docs.push(doc);
+                    }
                     Err(e) => {
                         log::warn!("Failed to read document {}: {}", record.path, e);
                     }
@@ -3593,6 +3605,45 @@ collections:
             0,
             "external delete of a decorated file must remove the row (id {id}), not orphan it"
         );
+    }
+
+    /// The read APIs (get_dynamic / list_dynamic, and their typed twins) must
+    /// surface the stored bare id, not the decorated file stem. The index row
+    /// already holds the bare id (Issue 1); previously the read path re-derived
+    /// id from the file stem, so list_dynamic reported `{id}-{title}` and broke
+    /// ref JOINs whose key is the bare id. (U1b — found by Donovan's live probe.)
+    #[test]
+    fn test_decorated_stem_read_apis_return_bare_id() {
+        let (_tmp, store) = setup_decorated_store();
+        let id = store
+            .collection("tasks")
+            .unwrap()
+            .insert(
+                serde_yaml::from_str("title: Ship It\nstatus: open").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(!id.contains("ship-it"), "insert returns the bare ulid, got {id}");
+
+        // get_dynamic surfaces the bare id, not the decorated stem.
+        let got = store.get_dynamic("tasks", &id).unwrap();
+        assert_eq!(got["id"], serde_json::Value::String(id.clone()));
+
+        // list_dynamic surfaces the bare id — the field ref JOINs key on.
+        let list = store.list_dynamic("tasks", &HashMap::new()).unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0]["id"],
+            serde_json::Value::String(id.clone()),
+            "list_dynamic must report the bare id, not the file stem"
+        );
+
+        // Typed read path agrees too.
+        let typed = store
+            .get_document::<serde_json::Value>("tasks", &id)
+            .unwrap();
+        assert_eq!(typed.id, id);
     }
 
     // ── Issue 3: watcher-path validation + non-aborting drain ────────
