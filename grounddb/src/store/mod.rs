@@ -209,8 +209,10 @@ fn template_extraction_hazard(
 fn field_alphabet_contains(def: &CollectionDefinition, field: &str, ch: char) -> bool {
     if field == "id" {
         match def.auto_id() {
-            // Crockford base32 (lowercased): digits + letters, no separators.
-            Some(AutoIdStrategy::Ulid) => false,
+            // Crockford base32 (lowercased): alphanumerics, no separators. So a
+            // separator delimiter ('-','/','.','_') never collides, but an
+            // alphanumeric literal delimiter (e.g. `{id}x{title}`) does.
+            Some(AutoIdStrategy::Ulid) => ch.is_ascii_alphanumeric(),
             // uuid: hex + '-'.
             Some(AutoIdStrategy::Uuid) => ch == '-' || ch.is_ascii_hexdigit(),
             // nanoid default alphabet includes '-' and '_'.
@@ -228,6 +230,24 @@ fn field_alphabet_contains(def: &CollectionDefinition, field: &str, ch: char) ->
 /// slug::slugify emits lowercase ascii letters, digits, and '-'.
 fn slug_alphabet_contains(ch: char) -> bool {
     ch == '-' || ch.is_ascii_lowercase() || ch.is_ascii_digit()
+}
+
+/// Whether a collection's directory already holds any document files on disk.
+/// Decides the mis-splittable enforcement tier (U1d): existing data → open and
+/// degrade (no lock-out); no data → hard reject at load.
+fn collection_has_documents(
+    root: &Path,
+    template: &PathTemplate,
+    def: &CollectionDefinition,
+) -> bool {
+    let base = root.join(template.base_directory());
+    if !base.exists() {
+        return false;
+    }
+    let pattern = format!("{}/**/*.{}", base.display(), def.file_extension());
+    glob::glob(&pattern)
+        .map(|mut it| it.any(|r| r.is_ok()))
+        .unwrap_or(false)
 }
 
 type ViewCallback = Box<dyn Fn(&[serde_json::Value]) + Send>;
@@ -380,26 +400,50 @@ impl Store {
         }
 
         // Detect collections whose template can mis-split during path→id
-        // recovery (U1d). Opening never fails on this — the invariant is "no
-        // silent wrong ids", not "no store opens". Reads always work; only the
-        // reindex/rebuild/reconcile paths refuse for these collections. Warn
-        // loudly so a recovering user understands why reads may be thin.
+        // recovery (U1d). Two-tier enforcement:
+        //   - Collection already has documents on disk → open must still
+        //     succeed (never lock a user out of data they need to migrate);
+        //     warn loudly and refuse only the unsafe reindex/rebuild/reconcile.
+        //   - No documents on disk (new collection / template change before the
+        //     first write) → HARD reject at load. Nothing to lock out, and a
+        //     config that cannot survive index reconstruction from disk is
+        //     broken, so fail fast instead of shipping a silent footgun.
+        // Invariant throughout: "no silent wrong ids" — never lock-out on data.
         let mut mis_splittable = HashSet::new();
+        let mut empty_hazards: Vec<String> = Vec::new();
         for (name, template) in &path_templates {
-            if let Some(def) = schema.collections.get(name) {
-                if let Some(reason) = template_extraction_hazard(template, def) {
-                    mis_splittable.insert(name.clone());
-                    log::warn!(
-                        "Collection '{name}' path template '{}' is mis-splittable: {reason}. \
-                         Reads for this collection reflect only what is already indexed and may \
-                         be empty or incomplete; reindex/rebuild is refused because ids cannot be \
-                         recovered from these filenames unambiguously. Migrate to a terminal-safe \
-                         template (end each field at '/', a date format, or the final field — e.g. \
-                         '{{id}}.md' or '{{status}}/{{title}}.md') and rebuild.",
-                        template.raw
-                    );
-                }
+            let def = match schema.collections.get(name) {
+                Some(d) => d,
+                None => continue,
+            };
+            let reason = match template_extraction_hazard(template, def) {
+                Some(r) => r,
+                None => continue,
+            };
+            mis_splittable.insert(name.clone());
+            if collection_has_documents(&root, template, def) {
+                log::warn!(
+                    "Collection '{name}' path template '{}' is mis-splittable: {reason}. \
+                     Reads for this collection reflect only what is already indexed and may \
+                     be empty or incomplete; reindex/rebuild is refused because ids cannot be \
+                     recovered from these filenames unambiguously. Migrate to a terminal-safe \
+                     template (end each field at '/', a date format, or the final field — e.g. \
+                     '{{id}}.md' or '{{status}}/{{title}}.md') and rebuild.",
+                    template.raw
+                );
+            } else {
+                empty_hazards.push(format!("'{name}' ({}): {reason}", template.raw));
             }
+        }
+        if !empty_hazards.is_empty() {
+            return Err(GroundDbError::Schema(format!(
+                "Refusing to open: path template(s) are mis-splittable and the collection has no \
+                 existing documents, so the index could not be reconstructed from disk. A config \
+                 that cannot survive rebuild-from-disk is rejected at load. Offending: {}. Migrate \
+                 to a terminal-safe template (end each field at '/', a date format, or the final \
+                 field — e.g. '{{id}}.md' or '{{status}}/{{title}}.md').",
+                empty_hazards.join("; ")
+            )));
         }
 
         let view_engine = ViewEngine::new(&schema)?;
@@ -1245,6 +1289,12 @@ impl Store {
     }
 
     /// Force rebuild of indexes and views, optionally for a specific collection.
+    ///
+    /// Note the intentional asymmetry for mis-splittable collections (U1d):
+    /// `rebuild(Some(name))` is an explicit request, so it returns a targeted
+    /// error; `rebuild(None)` shares `full_scan`, which warn-*skips* such
+    /// collections (leaving their index as-is) so a whole-store rebuild still
+    /// completes for the safe collections rather than aborting on one bad one.
     pub fn rebuild(&self, collection: Option<&str>) -> Result<()> {
         match collection {
             Some(name) => {
@@ -3894,15 +3944,33 @@ views:
         (tmp, store)
     }
 
+    /// Open a schema after seeding a throwaway document file into each given
+    /// collection directory — so a mis-splittable collection counts as "has
+    /// existing data" and opens in degraded mode instead of hard-rejecting
+    /// (the two-tier enforcement).
+    fn open_schema_seeded(schema: &str, seed_dirs: &[&str]) -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("schema.yaml"), schema).unwrap();
+        for dir in seed_dirs {
+            let d = tmp.path().join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("_seed.md"), "---\n---\n").unwrap();
+        }
+        let store = Store::open(tmp.path().to_str().unwrap()).unwrap();
+        (tmp, store)
+    }
+
     /// The generalized non-terminal-delimiter rule: a field whose value can
     /// contain the delimiter that follows it makes path→id/value recovery
     /// ambiguous. ulid (no separators) and date-format (fixed length) are safe;
     /// uuid/nanoid ids and slugged fields before a literal '-' are not.
     #[test]
     fn test_mis_splittable_detection() {
+        // Hazardous cases are seeded so open degrades instead of hard-rejecting.
         // uuid + decorated '-' → hazardous.
-        let (_a, s1) = open_schema(
+        let (_a, s1) = open_schema_seeded(
             "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: uuid }\n    fields:\n      title: { type: string, required: true }\n",
+            &["tasks"],
         );
         assert!(s1.mis_splittable.contains("tasks"), "uuid decorated is hazardous");
 
@@ -3912,9 +3980,18 @@ views:
         );
         assert!(!s2.mis_splittable.contains("tasks"), "ulid decorated is safe");
 
+        // ulid + ALPHANUMERIC delimiter ('x') → hazardous: ulid can emit 'x'
+        // (nit: the ulid arm checks is_ascii_alphanumeric, not blanket-safe).
+        let (_bx, s2x) = open_schema_seeded(
+            "collections:\n  tasks:\n    path: \"tasks/{id}x{title}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n",
+            &["tasks"],
+        );
+        assert!(s2x.mis_splittable.contains("tasks"), "ulid before an alphanumeric delimiter is hazardous");
+
         // Slugged non-terminal field before '-' → hazardous, ANY id strategy.
-        let (_c, s3) = open_schema(
+        let (_c, s3) = open_schema_seeded(
             "collections:\n  notes:\n    path: \"notes/{title}-{id}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n",
+            &["notes"],
         );
         assert!(s3.mis_splittable.contains("notes"), "{{title}}-{{id}} mis-splits on slug '-'");
 
@@ -3925,13 +4002,32 @@ views:
         assert!(!s4.mis_splittable.contains("posts"), "terminal/'/'/date delimiters are safe");
     }
 
+    /// Two-tier enforcement: a mis-splittable template with NO existing data on
+    /// disk (new config / template change before first write) is hard-rejected
+    /// at load — nothing to lock out, and it can't survive rebuild-from-disk.
+    #[test]
+    fn test_mis_splittable_hard_reject_when_no_data() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("schema.yaml"),
+            "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: uuid }\n    fields:\n      title: { type: string, required: true }\n",
+        )
+        .unwrap();
+        let err = Store::open(tmp.path().to_str().unwrap());
+        assert!(
+            err.is_err(),
+            "a mis-splittable collection with no data on disk must be rejected at open"
+        );
+    }
+
     /// A mis-splittable collection must still OPEN and serve API writes/reads
     /// (id is known at write time), but an explicit reindex is refused with an
     /// error rather than producing silent wrong ids. Never locks the user out.
     #[test]
     fn test_mis_splittable_open_and_reads_work_reindex_refused() {
-        let (_tmp, store) = open_schema(
+        let (_tmp, store) = open_schema_seeded(
             "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: uuid }\n    fields:\n      title: { type: string, required: true }\n    additional_properties: false\n    strict: true\n",
+            &["tasks"],
         );
 
         // API write works (id known via determine_id, no extraction).
@@ -3957,8 +4053,9 @@ views:
     /// mis-splittable collection reconcile is skipped, so front matter is safe.
     #[test]
     fn test_mis_splittable_reconcile_does_not_corrupt_frontmatter() {
-        let (tmp, store) = open_schema(
+        let (tmp, store) = open_schema_seeded(
             "collections:\n  notes:\n    path: \"notes/{title}-{id}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n      body: { type: string }\n    additional_properties: false\n    strict: true\n",
+            &["notes"],
         );
         assert!(store.mis_splittable.contains("notes"));
 
