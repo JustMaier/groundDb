@@ -87,7 +87,24 @@ impl FileWatcher {
                             for (path, kind) in pending.drain(..) {
                                 seen.insert(path, kind);
                             }
-                            for (path, kind) in seen {
+                            // Emit in a deterministic order: creates/modifies
+                            // before deletes, then by path. A move surfaces as
+                            // Remove(old)+Create(new) at different paths (both
+                            // survive dedup); emitting the Create first lets the
+                            // store's stale-remove guard treat the trailing
+                            // Remove as stale. HashMap iteration order is
+                            // otherwise unspecified, which made move handling
+                            // nondeterministic.
+                            let mut ordered: Vec<(PathBuf, ChangeKind)> =
+                                seen.into_iter().collect();
+                            ordered.sort_by(|a, b| {
+                                let rank = |k: &ChangeKind| match k {
+                                    ChangeKind::Deleted => 1,
+                                    _ => 0,
+                                };
+                                rank(&a.1).cmp(&rank(&b.1)).then_with(|| a.0.cmp(&b.0))
+                            });
+                            for (path, kind) in ordered {
                                 if event_tx.send(WatcherEvent { path, kind }).is_err() {
                                     return; // Receiver dropped
                                 }

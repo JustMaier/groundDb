@@ -16,17 +16,143 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 
 /// Unique subscription identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
 
+/// Classifies a failure encountered while ingesting a watcher event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherErrorKind {
+    /// The file couldn't be read or parsed (malformed YAML front matter, I/O
+    /// on read).
+    Parse,
+    /// The document parsed but failed schema validation (strict collections).
+    Validation,
+    /// A filesystem or index I/O error while applying the change.
+    Io,
+}
+
 /// An event describing a change to a document in a collection.
+///
+/// Marked `#[non_exhaustive]`: new variants (e.g. `Error`) may be added, so
+/// external consumers must include a wildcard arm when matching.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ChangeEvent {
     Inserted { id: String, data: serde_json::Value },
     Updated { id: String, data: serde_json::Value },
     Deleted { id: String },
+    /// A watcher-ingested file could not be indexed. The file is left
+    /// unindexed (or its prior index row untouched); the drain continues with
+    /// the remaining files rather than aborting.
+    Error {
+        collection: String,
+        path: String,
+        kind: WatcherErrorKind,
+        message: String,
+    },
+}
+
+/// Map an error raised while ingesting a watcher event to a `WatcherErrorKind`.
+fn classify_watcher_error(err: &GroundDbError) -> WatcherErrorKind {
+    match err {
+        GroundDbError::Validation(_) => WatcherErrorKind::Validation,
+        GroundDbError::Yaml(_) => WatcherErrorKind::Parse,
+        GroundDbError::Io(_) => WatcherErrorKind::Io,
+        _ => WatcherErrorKind::Io,
+    }
+}
+
+/// How long a recorded self-write stays eligible to suppress its watcher echo.
+/// Long enough to outlast debounce + processing latency, short enough that a
+/// later genuine external edit to the same path is never eaten.
+const SELF_WRITE_TTL: Duration = Duration::from_secs(5);
+
+/// Records file writes the store performs itself so the file watcher can
+/// suppress the echo events those writes generate. Keyed by root-relative,
+/// forward-slash-normalized path. A write records the content hash of the
+/// bytes written; a delete records a tombstone. Records are one-shot (consumed
+/// on match) and TTL-bounded, so a hand-edit — which produces a different
+/// content hash — is never suppressed even if it lands before the echo.
+#[derive(Default)]
+struct SelfWriteLedger {
+    writes: Mutex<HashMap<String, Vec<(u64, Instant)>>>,
+    deletes: Mutex<HashMap<String, Instant>>,
+}
+
+impl SelfWriteLedger {
+    fn record_write(&self, rel_path: &str, hash: u64) {
+        let now = Instant::now();
+        let mut w = self.writes.lock().unwrap();
+        prune_writes(&mut w, now);
+        w.entry(rel_path.to_string()).or_default().push((hash, now));
+    }
+
+    fn record_delete(&self, rel_path: &str) {
+        let now = Instant::now();
+        let mut d = self.deletes.lock().unwrap();
+        d.retain(|_, t| now.duration_since(*t) < SELF_WRITE_TTL);
+        d.insert(rel_path.to_string(), now);
+    }
+
+    /// If a still-live write with this content hash was recorded for the path,
+    /// consume it and return true (the event is our own echo). A different
+    /// hash — a genuine external edit — leaves the record intact and returns
+    /// false.
+    fn take_write(&self, rel_path: &str, hash: u64) -> bool {
+        let now = Instant::now();
+        let mut w = self.writes.lock().unwrap();
+        prune_writes(&mut w, now);
+        if let Some(list) = w.get_mut(rel_path) {
+            if let Some(pos) = list.iter().position(|(h, _)| *h == hash) {
+                list.remove(pos);
+                if list.is_empty() {
+                    w.remove(rel_path);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn take_delete(&self, rel_path: &str) -> bool {
+        let now = Instant::now();
+        let mut d = self.deletes.lock().unwrap();
+        d.retain(|_, t| now.duration_since(*t) < SELF_WRITE_TTL);
+        d.remove(rel_path).is_some()
+    }
+}
+
+fn prune_writes(w: &mut HashMap<String, Vec<(u64, Instant)>>, now: Instant) {
+    w.retain(|_, list| {
+        list.retain(|(_, t)| now.duration_since(*t) < SELF_WRITE_TTL);
+        !list.is_empty()
+    });
+}
+
+/// Stable-within-process hash of a document's serialized bytes. Used only to
+/// match a store self-write against its watcher echo — never persisted, so
+/// `DefaultHasher`'s cross-version instability is irrelevant here.
+fn hash_document_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The content hash the watcher will observe for a document the store is about
+/// to write — computed from the exact bytes `write_document` serializes.
+fn self_write_hash(data: &serde_yaml::Value, content: Option<&str>) -> Result<u64> {
+    let serialized = document::serialize_document(data, content)?;
+    Ok(hash_document_bytes(serialized.as_bytes()))
+}
+
+/// Normalize a path to the root-relative, forward-slash form used as the
+/// ledger key and by `collection_for_path` / watcher processing.
+fn normalize_rel(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 type ViewCallback = Box<dyn Fn(&[serde_json::Value]) + Send>;
@@ -124,6 +250,8 @@ pub struct Store {
     subscriptions: Arc<SubscriptionManager>,
     /// File watcher handle. None until `watch()` is called.
     _watcher: Mutex<Option<FileWatcher>>,
+    /// Ledger of the store's own file writes, used to suppress watcher echoes.
+    self_writes: SelfWriteLedger,
 }
 
 impl Store {
@@ -183,6 +311,7 @@ impl Store {
             view_engine,
             subscriptions: Arc::new(SubscriptionManager::new()),
             _watcher: Mutex::new(None),
+            self_writes: SelfWriteLedger::default(),
         };
 
         store.boot()?;
@@ -391,10 +520,17 @@ impl Store {
                 .to_string_lossy()
                 .replace('\\', "/");
 
+            // Derive the id by reverse-mapping the path through the template
+            // so a decorated stem like `{id}-{title}.md` recovers the stored
+            // `{id}` (matching what insert wrote) instead of indexing the whole
+            // stem as a second, divergent id.
+            let id = self
+                .id_for_path(name, &rel_path)
+                .unwrap_or_else(|| doc.id.clone());
             let created_str = doc.created_at.to_rfc3339();
             let modified_str = doc.modified_at.to_rfc3339();
             self.db.upsert_document(
-                &doc.id,
+                &id,
                 name,
                 &rel_path,
                 &doc.data,
@@ -1064,16 +1200,58 @@ impl Store {
         }
         drop(guard); // Release lock before doing work
 
+        self.apply_watcher_events(events)
+    }
+
+    /// Apply a drained batch of watcher events to the index and rebuild
+    /// affected views. Split out from `process_watcher_events` so the
+    /// fault-isolation and ordering behavior can be tested without a live
+    /// filesystem watcher.
+    fn apply_watcher_events(&self, mut events: Vec<WatcherEvent>) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
 
-        // Group by collection so we can batch updates
+        // Process creates/modifies before deletes. Combined with the
+        // stale-remove guard in process_single_watcher_event, this makes a
+        // move (Remove(old)+Create(new)) safe regardless of the order the
+        // watcher surfaced them: the Create points the index row at the new
+        // path, and the later Remove of the old path sees the mismatch and
+        // skips. Stable sort preserves per-file order within each group.
+        events.sort_by_key(|e| match e.kind {
+            ChangeKind::Deleted => 1,
+            _ => 0,
+        });
+
+        // Group by collection so we can batch updates. Each file is processed
+        // in isolation: a failure on one (malformed YAML, validation error)
+        // surfaces as an Error change event and the drain continues with the
+        // rest, rather than aborting the whole batch and silently dropping the
+        // remaining already-drained events.
         let mut affected_collections = std::collections::HashSet::new();
         for event in &events {
             if let Some(collection_name) = self.collection_for_path(&event.path) {
                 affected_collections.insert(collection_name.clone());
-                self.process_single_watcher_event(&collection_name, event)?;
+                if let Err(e) = self.process_single_watcher_event(&collection_name, event) {
+                    let rel_path = event
+                        .path
+                        .strip_prefix(&self.root)
+                        .unwrap_or(&event.path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    log::warn!(
+                        "Skipping watcher event for {rel_path} in '{collection_name}': {e}"
+                    );
+                    self.subscriptions.notify_collection(
+                        &collection_name,
+                        ChangeEvent::Error {
+                            collection: collection_name.clone(),
+                            path: rel_path,
+                            kind: classify_watcher_error(&e),
+                            message: e.to_string(),
+                        },
+                    );
+                }
             }
         }
 
@@ -1093,6 +1271,45 @@ impl Store {
         }
 
         Ok(())
+    }
+
+    /// Record a file the store just wrote, so the watcher echo it generates is
+    /// suppressed. `rel_path` is root-relative; `data`/`content` must be the
+    /// exact bytes handed to `write_document`.
+    fn record_self_write(
+        &self,
+        rel_path: &str,
+        data: &serde_yaml::Value,
+        content: Option<&str>,
+    ) -> Result<()> {
+        let hash = self_write_hash(data, content)?;
+        self.self_writes.record_write(&normalize_rel(rel_path), hash);
+        Ok(())
+    }
+
+    /// Record a file the store just deleted or moved away from, so the watcher
+    /// Remove echo is suppressed.
+    fn record_self_delete(&self, rel_path: &str) {
+        self.self_writes.record_delete(&normalize_rel(rel_path));
+    }
+
+    /// Derive a document's id from its root-relative path by reverse-mapping
+    /// through the collection's path template (via `extract`). For a template
+    /// with an explicit `{id}` field this recovers the stored id even from a
+    /// decorated stem like `{id}-{title}.md`. Falls back to the whole file
+    /// stem when the template has no `{id}` field or the path doesn't match.
+    fn id_for_path(&self, collection: &str, rel_path: &str) -> Option<String> {
+        if let Some(template) = self.path_templates.get(collection) {
+            if let Some(extracted) = template.extract(rel_path) {
+                if let Some(id) = extracted.get("id") {
+                    return Some(id.clone());
+                }
+            }
+        }
+        Path::new(rel_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
     }
 
     /// Determine which collection a file path belongs to.
@@ -1125,7 +1342,35 @@ impl Store {
         match event.kind {
             ChangeKind::Created | ChangeKind::Modified => {
                 if event.path.exists() {
+                    // Own-write suppression: if this file's current content
+                    // matches a write the store itself just made, this event is
+                    // the echo of that write — consume it and stop. A genuine
+                    // external edit produces a different hash and is not
+                    // suppressed, even if it arrives before the echo.
+                    if let Ok(raw) = std::fs::read_to_string(&event.path) {
+                        let hash = hash_document_bytes(raw.as_bytes());
+                        if self.self_writes.take_write(&rel_path, hash) {
+                            return Ok(());
+                        }
+                    }
+
                     let mut doc = document::read_document(&event.path)?;
+
+                    // Enforce schema validation on hand-edited files, mirroring
+                    // the API write path. For strict collections a violation
+                    // (stray field, non-member enum, missing required) becomes
+                    // an error the caller surfaces as an Error event; the doc is
+                    // not indexed. Non-strict collections only accrue warnings,
+                    // so this is a no-op for them — same as the API.
+                    if let Some(def) = self.schema.collections.get(collection_name) {
+                        let result = validation::validate_document(&self.schema, def, &doc.data);
+                        if !result.is_ok() {
+                            return Err(GroundDbError::Validation(format!(
+                                "Watcher-ingested {collection_name}/{rel_path} failed validation: {}",
+                                result.errors.join("; ")
+                            )));
+                        }
+                    }
 
                     // Reconcile path-extracted values with YAML front matter.
                     // When a file is moved between directories, the path may
@@ -1189,14 +1434,29 @@ impl Store {
                                     &doc.data,
                                     doc.content.as_deref(),
                                 )?;
+                                // The directory-wins reconcile is itself a store
+                                // write. Record it so its own echo (and, with
+                                // Issue 3 validation live on this path, a
+                                // re-validation loop) is suppressed.
+                                self.record_self_write(
+                                    &rel_path,
+                                    &doc.data,
+                                    doc.content.as_deref(),
+                                )?;
                             }
                         }
                     }
 
+                    // Recover the stored id from the path template so a
+                    // decorated stem doesn't reindex under a divergent id and
+                    // create a duplicate row on reindex.
+                    let id = self
+                        .id_for_path(collection_name, &rel_path)
+                        .unwrap_or_else(|| doc.id.clone());
                     let created_str = doc.created_at.to_rfc3339();
                     let modified_str = doc.modified_at.to_rfc3339();
                     self.db.upsert_document(
-                        &doc.id,
+                        &id,
                         collection_name,
                         &rel_path,
                         &doc.data,
@@ -1208,50 +1468,50 @@ impl Store {
                     let change = if event.kind == ChangeKind::Created {
                         let json_data = serde_json::to_value(&doc.data)?;
                         ChangeEvent::Inserted {
-                            id: doc.id,
+                            id,
                             data: json_data,
                         }
                     } else {
                         let json_data = serde_json::to_value(&doc.data)?;
                         ChangeEvent::Updated {
-                            id: doc.id,
+                            id,
                             data: json_data,
                         }
                     };
                     self.subscriptions.notify_collection(collection_name, change);
                 } else {
-                    // File no longer exists at this path — this is the "from" side
-                    // of a rename/move event. Treat it as a delete so stale records
-                    // are cleaned up.
-                    let id = event
-                        .path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !id.is_empty() {
-                        self.db.delete_document(collection_name, &id)?;
-                        self.subscriptions.notify_collection(
-                            collection_name,
-                            ChangeEvent::Deleted { id },
-                        );
-                    }
+                    // The file vanished between the event firing and now — the
+                    // stale "from" side of a move, or a rapid re-move (A→B→C)
+                    // whose intermediate file is already gone. Do nothing: the
+                    // matching Remove event performs index cleanup through the
+                    // stale-remove guard below. Deleting by file stem here would
+                    // wrongly key on the vanished path and could nuke the live
+                    // row that a Create already pointed at the new location.
                 }
             }
             ChangeKind::Deleted => {
-                // Extract ID from the filename
-                let id = event
-                    .path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !id.is_empty() {
-                    self.db.delete_document(collection_name, &id)?;
-                    self.subscriptions.notify_collection(
-                        collection_name,
-                        ChangeEvent::Deleted { id },
-                    );
+                // Own-delete suppression: an API delete/move echoes a Remove for
+                // the old path; consume it.
+                if self.self_writes.take_delete(&rel_path) {
+                    return Ok(());
+                }
+
+                // Stale-remove guard: only delete the index row if it still
+                // points at the removed path. If the row already moved to a new
+                // path (a Create processed the move's other half first), this
+                // Remove is stale — skip it. Order-independent and
+                // batch-independent, since it keys on index state, not on which
+                // debounce batch the events landed in.
+                if let Some(id) = self.id_for_path(collection_name, &rel_path) {
+                    if let Some(record) = self.db.get_document(collection_name, &id)? {
+                        if record.path == rel_path {
+                            self.db.delete_document(collection_name, &id)?;
+                            self.subscriptions.notify_collection(
+                                collection_name,
+                                ChangeEvent::Deleted { id },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1564,6 +1824,7 @@ impl<'a> Collection<'a> {
 
                     // Write the file
                     document::write_document(&abs_resolved, &data, content)?;
+                    self.store.record_self_write(&resolved, &data, content)?;
 
                     // Extract ID from the resolved filename
                     let resolved_id = Path::new(&resolved)
@@ -1606,6 +1867,7 @@ impl<'a> Collection<'a> {
 
         // Write the file
         document::write_document(&abs_path, &data, content)?;
+        self.store.record_self_write(&rel_path, &data, content)?;
 
         // Read timestamps from the newly written file
         let meta = std::fs::metadata(&abs_path)?;
@@ -1676,13 +1938,16 @@ impl<'a> Collection<'a> {
             // Path changed -- file needs to move
             // Write to new location first
             document::write_document(&new_abs_path, &data, content)?;
+            self.store.record_self_write(&new_rel_path, &data, content)?;
             // Delete old file
             if old_abs_path.exists() {
                 document::delete_document(&old_abs_path)?;
+                self.store.record_self_delete(&record.path);
             }
         } else {
             // Same path -- just update the file
             document::write_document(&new_abs_path, &data, content)?;
+            self.store.record_self_write(&new_rel_path, &data, content)?;
         }
 
         // Read timestamps from the written file
@@ -1772,6 +2037,7 @@ impl<'a> Collection<'a> {
         let abs_path = self.store.root.join(&record.path);
         if abs_path.exists() {
             document::delete_document(&abs_path)?;
+            self.store.record_self_delete(&record.path);
         }
 
         // Remove from index
@@ -1852,6 +2118,11 @@ impl<'a> Collection<'a> {
                                                 document::write_document(
                                                     &file_path, &data, existing_doc.content.as_deref(),
                                                 )?;
+                                                self.store.record_self_write(
+                                                    &ref_doc.path,
+                                                    &data,
+                                                    existing_doc.content.as_deref(),
+                                                )?;
                                                 // Read timestamps from the updated file
                                                 let meta = std::fs::metadata(&file_path)?;
                                                 let created: chrono::DateTime<chrono::Utc> = meta
@@ -1879,6 +2150,10 @@ impl<'a> Collection<'a> {
                                                     .join("_archive")
                                                     .join(&ref_doc.path);
                                                 document::move_document(&old_path, &archive_path)?;
+                                                // Old path leaves the watched tree
+                                                // (destination is under _archive/);
+                                                // suppress the Remove echo.
+                                                self.store.record_self_delete(&ref_doc.path);
                                                 self.store
                                                     .db
                                                     .delete_document(
@@ -1912,18 +2187,18 @@ impl<'a> Collection<'a> {
             });
         }
 
-        // For path-based IDs, render the template and extract the filename stem
+        // For path-based IDs, render the template then reverse-map through it
+        // to recover the id. For a template with an explicit `{id}` field this
+        // yields the bare id even from a decorated stem (`{id}-{title}.md`);
+        // for a plain template (`{name}.md`) it falls back to the file stem —
+        // the same value the watcher and boot scan derive, so all three agree.
         let template = self.template();
         let rendered = template.render(data, None)?;
-        let id = Path::new(&rendered)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                GroundDbError::Other(format!(
-                    "Cannot extract ID from rendered path: {rendered}"
-                ))
-            })?
-            .to_string();
+        let id = self.store.id_for_path(&self.name, &rendered).ok_or_else(|| {
+            GroundDbError::Other(format!(
+                "Cannot extract ID from rendered path: {rendered}"
+            ))
+        })?;
 
         Ok(id)
     }
@@ -3015,6 +3290,415 @@ views:
         // File should not have been rewritten since name already matches
         let after_content = std::fs::read_to_string(&user_path).unwrap();
         assert_eq!(original_content, after_content, "File should not be rewritten when path already matches YAML");
+    }
+
+    // ── Issue 2: own-write suppression + move safety ─────────────────
+
+    /// An API write echoes back through the watcher as a Created/Modified
+    /// event on the same file. With identical content it must be suppressed by
+    /// the self-write ledger, so subscribers fire exactly once (from the API
+    /// call), not twice.
+    #[test]
+    fn test_own_write_echo_suppressed() {
+        let (tmp, store) = setup_test_store();
+
+        let users = store.collection("users").unwrap();
+        let data: serde_yaml::Value =
+            serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap();
+        users.insert(data, None).unwrap();
+
+        // Subscribe AFTER the insert so only echoes are counted.
+        let received = Arc::new(Mutex::new(Vec::<ChangeEvent>::new()));
+        let received_clone = received.clone();
+        store.on_collection_change(
+            "users",
+            Box::new(move |event| received_clone.lock().unwrap().push(event)),
+        );
+
+        // Echo: watcher re-reports the file the API just wrote, same content.
+        let event = WatcherEvent {
+            path: tmp.path().join("users/alice.md"),
+            kind: ChangeKind::Created,
+        };
+        store.process_single_watcher_event("users", &event).unwrap();
+
+        assert_eq!(
+            received.lock().unwrap().len(),
+            0,
+            "Own-write echo should be suppressed — no duplicate notification"
+        );
+    }
+
+    /// The ledger is content-hash keyed, so a genuine external edit that lands
+    /// before the echo is processed (different content → different hash) must
+    /// NOT be swallowed. Liz's one-shot-must-not-eat-the-edit race.
+    #[test]
+    fn test_hand_edit_after_api_write_not_suppressed() {
+        let (tmp, store) = setup_test_store();
+
+        let users = store.collection("users").unwrap();
+        let data: serde_yaml::Value =
+            serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap();
+        users.insert(data, None).unwrap();
+
+        // External edit: same path, different content.
+        let path = tmp.path().join("users/alice.md");
+        let edited = document::read_document(&path).unwrap();
+        let mut edited_data = edited.data.clone();
+        edited_data.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("email".into()),
+            serde_yaml::Value::String("alice+edited@test.com".into()),
+        );
+        document::write_document(&path, &edited_data, edited.content.as_deref()).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<ChangeEvent>::new()));
+        let received_clone = received.clone();
+        store.on_collection_change(
+            "users",
+            Box::new(move |event| received_clone.lock().unwrap().push(event)),
+        );
+
+        store
+            .process_single_watcher_event(
+                "users",
+                &WatcherEvent { path: path.clone(), kind: ChangeKind::Modified },
+            )
+            .unwrap();
+
+        assert_eq!(
+            received.lock().unwrap().len(),
+            1,
+            "Genuine hand-edit must be indexed, not suppressed as an echo"
+        );
+        let doc = store.get_dynamic("users", "alice").unwrap();
+        assert_eq!(
+            doc["email"],
+            serde_json::Value::String("alice+edited@test.com".into())
+        );
+    }
+
+    /// A path-field change moves the file: watcher surfaces Remove(old) +
+    /// Create(new). Even in the dangerous order (Create processed first), the
+    /// stale-remove guard must keep the row: the Remove sees the row already
+    /// points at the new path and skips. Previously the Remove deleted the live
+    /// row by file stem, corrupting the index.
+    #[test]
+    fn test_move_create_before_remove_keeps_row() {
+        let (tmp, store) = setup_test_store();
+
+        let users = store.collection("users").unwrap();
+        users
+            .insert(
+                serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap(),
+                None,
+            )
+            .unwrap();
+        let posts = store.collection("posts").unwrap();
+        posts
+            .insert(
+                serde_yaml::from_str(
+                    "title: My Post\nauthor_id: alice\ndate: '2026-02-13'\nstatus: draft",
+                )
+                .unwrap(),
+                Some("Body"),
+            )
+            .unwrap();
+
+        let id = "2026-02-13-my-post";
+        let draft = tmp.path().join("posts/draft/2026-02-13-my-post.md");
+        let published = tmp.path().join("posts/published/2026-02-13-my-post.md");
+        std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+        std::fs::rename(&draft, &published).unwrap();
+
+        // Dangerous order: Create(new) before Remove(old).
+        store
+            .process_single_watcher_event(
+                "posts",
+                &WatcherEvent { path: published.clone(), kind: ChangeKind::Created },
+            )
+            .unwrap();
+        store
+            .process_single_watcher_event(
+                "posts",
+                &WatcherEvent { path: draft.clone(), kind: ChangeKind::Deleted },
+            )
+            .unwrap();
+
+        let doc = store.get_dynamic("posts", id).unwrap();
+        assert_eq!(doc["status"], serde_json::Value::String("published".into()));
+        let rows = store.db.list_documents("posts").unwrap();
+        assert_eq!(rows.len(), 1, "Exactly one row after move");
+        assert_eq!(rows[0].path, "posts/published/2026-02-13-my-post.md");
+    }
+
+    /// Rapid double move A→B→C: only the final file survives on disk, and a
+    /// Create can arrive for an intermediate path whose file is already gone.
+    /// That Create must be a benign skip (not an error, not a row deletion),
+    /// and the row must end up at the final path exactly once. Arabella's
+    /// residual edge; also proves the drain doesn't abort on the vanished read.
+    #[test]
+    fn test_double_move_benign_skip_no_corruption() {
+        let (tmp, store) = setup_test_store();
+
+        let users = store.collection("users").unwrap();
+        users
+            .insert(
+                serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap(),
+                None,
+            )
+            .unwrap();
+        let posts = store.collection("posts").unwrap();
+        posts
+            .insert(
+                serde_yaml::from_str(
+                    "title: My Post\nauthor_id: alice\ndate: '2026-02-13'\nstatus: draft",
+                )
+                .unwrap(),
+                Some("Body"),
+            )
+            .unwrap();
+
+        let id = "2026-02-13-my-post";
+        let name = "2026-02-13-my-post.md";
+        let draft = tmp.path().join("posts/draft").join(name);
+        let published = tmp.path().join("posts/published").join(name);
+        let archived = tmp.path().join("posts/archived").join(name);
+
+        std::fs::create_dir_all(published.parent().unwrap()).unwrap();
+        std::fs::rename(&draft, &published).unwrap();
+        std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        std::fs::rename(&published, &archived).unwrap();
+
+        let ev = |p: &std::path::Path, k: ChangeKind| WatcherEvent {
+            path: p.to_path_buf(),
+            kind: k,
+        };
+        // Final Create, two stale Removes, and a Create for the vanished
+        // intermediate — all must be handled without error or corruption.
+        store
+            .process_single_watcher_event("posts", &ev(&archived, ChangeKind::Created))
+            .unwrap();
+        store
+            .process_single_watcher_event("posts", &ev(&draft, ChangeKind::Deleted))
+            .unwrap();
+        store
+            .process_single_watcher_event("posts", &ev(&published, ChangeKind::Deleted))
+            .unwrap();
+        store
+            .process_single_watcher_event("posts", &ev(&published, ChangeKind::Created))
+            .unwrap();
+
+        let rows = store.db.list_documents("posts").unwrap();
+        assert_eq!(rows.len(), 1, "Exactly one row after double move");
+        assert_eq!(rows[0].path, "posts/archived/2026-02-13-my-post.md");
+        let doc = store.get_dynamic("posts", id).unwrap();
+        assert_eq!(doc["status"], serde_json::Value::String("archived".into()));
+    }
+
+    // ── Issue 1: decorated stems must not duplicate index rows ───────
+
+    /// Store with a decorated `{id}-{title}` path template and auto ulid ids.
+    fn setup_decorated_store() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let schema = r#"
+collections:
+  tasks:
+    path: "tasks/{status}/{id}-{title}.md"
+    id: { auto: ulid }
+    fields:
+      title: { type: string, required: true }
+      status: { type: string, enum: [open, done], default: open }
+    additional_properties: false
+    strict: true
+"#;
+        std::fs::write(tmp.path().join("schema.yaml"), schema).unwrap();
+        let store = Store::open(tmp.path().to_str().unwrap()).unwrap();
+        (tmp, store)
+    }
+
+    /// With a decorated stem, reindexing a file (external touch → watcher
+    /// Modified) must recover the stored bare ulid via the path template and
+    /// upsert the SAME row — not index the whole `{id}-{title}` stem as a
+    /// second, divergent id.
+    #[test]
+    fn test_decorated_stem_no_duplicate_row_on_reindex() {
+        let (tmp, store) = setup_decorated_store();
+
+        let id = store
+            .collection("tasks")
+            .unwrap()
+            .insert(
+                serde_yaml::from_str("title: Ship It\nstatus: open").unwrap(),
+                None,
+            )
+            .unwrap();
+
+        // The stored id is the bare ulid, not the decorated stem.
+        assert!(!id.contains("ship-it"), "id should be the bare ulid, got {id}");
+        let rows = store.db.list_documents("tasks").unwrap();
+        assert_eq!(rows.len(), 1);
+        let rel = rows[0].path.clone();
+        assert!(
+            rel.ends_with(&format!("{id}-ship-it.md")),
+            "file should be decorated, got {rel}"
+        );
+
+        // Genuine external edit (different content so it's not suppressed as
+        // our own write), then a watcher Modified reindex.
+        let abs = tmp.path().join(&rel);
+        let doc = document::read_document(&abs).unwrap();
+        document::write_document(&abs, &doc.data, Some("touched")).unwrap();
+        store
+            .process_single_watcher_event(
+                "tasks",
+                &WatcherEvent { path: abs.clone(), kind: ChangeKind::Modified },
+            )
+            .unwrap();
+
+        let rows = store.db.list_documents("tasks").unwrap();
+        assert_eq!(rows.len(), 1, "reindex must not duplicate the row");
+        assert_eq!(rows[0].id, id, "id must remain the bare ulid after reindex");
+    }
+
+    /// External deletion of a decorated file must remove the bare-ulid row it
+    /// belongs to — the delete path recovers the id via the template, rather
+    /// than trying (and failing) to delete a row keyed by the whole stem and
+    /// orphaning the real one.
+    #[test]
+    fn test_decorated_stem_external_delete_removes_row() {
+        let (tmp, store) = setup_decorated_store();
+
+        let id = store
+            .collection("tasks")
+            .unwrap()
+            .insert(
+                serde_yaml::from_str("title: Ship It\nstatus: open").unwrap(),
+                None,
+            )
+            .unwrap();
+        let rel = store.db.list_documents("tasks").unwrap()[0].path.clone();
+        let abs = tmp.path().join(&rel);
+
+        std::fs::remove_file(&abs).unwrap();
+        store
+            .process_single_watcher_event(
+                "tasks",
+                &WatcherEvent { path: abs, kind: ChangeKind::Deleted },
+            )
+            .unwrap();
+
+        let rows = store.db.list_documents("tasks").unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "external delete of a decorated file must remove the row (id {id}), not orphan it"
+        );
+    }
+
+    // ── Issue 3: watcher-path validation + non-aborting drain ────────
+
+    /// A hand-edited file that violates the schema (strict collection) must be
+    /// rejected on the watcher path just like an API write: surfaced as an
+    /// Error change event, and NOT indexed with the invalid data.
+    #[test]
+    fn test_watcher_validation_rejects_invalid_edit() {
+        let (tmp, store) = setup_test_store();
+        let users = store.collection("users").unwrap();
+        users
+            .insert(
+                serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap(),
+                None,
+            )
+            .unwrap();
+        let path = tmp.path().join("users/alice.md");
+
+        // Hand-edit to a non-member enum value (role ∉ [admin, member, guest]).
+        let doc = document::read_document(&path).unwrap();
+        let mut bad = doc.data.clone();
+        bad.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("role".into()),
+            serde_yaml::Value::String("superuser".into()),
+        );
+        document::write_document(&path, &bad, None).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<ChangeEvent>::new()));
+        let rc = received.clone();
+        store.on_collection_change("users", Box::new(move |e| rc.lock().unwrap().push(e)));
+
+        store
+            .apply_watcher_events(vec![WatcherEvent {
+                path: path.clone(),
+                kind: ChangeKind::Modified,
+            }])
+            .unwrap();
+
+        let events = received.lock().unwrap();
+        assert_eq!(events.len(), 1, "should emit exactly one Error event");
+        match &events[0] {
+            ChangeEvent::Error { kind, collection, .. } => {
+                assert_eq!(*kind, WatcherErrorKind::Validation);
+                assert_eq!(collection, "users");
+            }
+            other => panic!("expected Error event, got {other:?}"),
+        }
+
+        // The index was not updated with the invalid data — its stored record
+        // still holds the valid default role, not the rejected value.
+        let rec = store.db.get_document("users", "alice").unwrap().unwrap();
+        let data = rec.parse_data().unwrap();
+        assert_eq!(data["role"], serde_yaml::Value::String("member".into()));
+    }
+
+    /// One malformed file in a drain batch must not abort the batch: the other,
+    /// valid edits in the same batch must still be applied. Previously a parse
+    /// error propagated via `?` and dropped every remaining drained event.
+    #[test]
+    fn test_drain_not_aborted_by_malformed_file() {
+        let (tmp, store) = setup_test_store();
+        let users = store.collection("users").unwrap();
+        users
+            .insert(
+                serde_yaml::from_str("name: Alice\nemail: alice@test.com").unwrap(),
+                None,
+            )
+            .unwrap();
+        users
+            .insert(
+                serde_yaml::from_str("name: Bob\nemail: bob@test.com").unwrap(),
+                None,
+            )
+            .unwrap();
+
+        let alice = tmp.path().join("users/alice.md");
+        let bob = tmp.path().join("users/bob.md");
+
+        // File A: broken YAML front matter (unclosed quote).
+        std::fs::write(&alice, "---\nname: \"Alice\nemail: alice@test.com\n---\n").unwrap();
+        // File B: a valid edit.
+        let bdoc = document::read_document(&bob).unwrap();
+        let mut bdata = bdoc.data.clone();
+        bdata.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("email".into()),
+            serde_yaml::Value::String("bob+new@test.com".into()),
+        );
+        document::write_document(&bob, &bdata, None).unwrap();
+
+        store
+            .apply_watcher_events(vec![
+                WatcherEvent { path: alice.clone(), kind: ChangeKind::Modified },
+                WatcherEvent { path: bob.clone(), kind: ChangeKind::Modified },
+            ])
+            .unwrap();
+
+        // Bob's valid edit reached the INDEX despite Alice's malformed file.
+        // (Read the index record, not the file — the file always has the edit;
+        // an aborted drain would leave the index stale.)
+        let rec = store.db.get_document("users", "bob").unwrap().unwrap();
+        let data = rec.parse_data().unwrap();
+        assert_eq!(
+            data["email"],
+            serde_yaml::Value::String("bob+new@test.com".into())
+        );
     }
 
     #[test]
