@@ -83,6 +83,19 @@ views:
     materialize: true
 ```
 
+> **Path template caveat (decorated stems).** A document's id is recovered from
+> its path, not stored in front matter, so the index must be reconstructible by
+> scanning disk. Id recovery splits the filename at literal separators, which is
+> only unambiguous when a non-terminal field's value cannot contain the
+> separator that follows it. In practice: a "decorated" stem such as
+> `{id}-{title}.md` currently requires `id: { auto: ulid }` — ulid's alphabet
+> excludes `-`. Do **not** use `uuid`/`nanoid` ids (their alphabets contain `-`
+> and `_`) or place a multi-word/slugged field before a literal `-` in a
+> non-terminal position; those can mis-split on reindex. Templates that end each
+> field at `/`, a date format, or the terminal field (e.g.
+> `{status}/{date:YYYY-MM-DD}-{title}.md`) are safe with any id strategy. A
+> schema-load check to enforce this is planned.
+
 ### Set up code generation
 
 Add a `build.rs`:
