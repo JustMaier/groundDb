@@ -13,7 +13,7 @@ use crate::view::{self as view_engine, ViewEngine};
 use crate::watcher::{ChangeKind, FileWatcher, WatcherEvent};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
@@ -155,6 +155,81 @@ fn normalize_rel(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// Determine whether a path template can mis-split when recovering field/id
+/// values from a filename (U1d). Returns a human-readable reason if hazardous,
+/// else `None`.
+///
+/// `extract()` consumes each non-terminal field up to the next literal
+/// delimiter. That is only unambiguous when the field's value alphabet cannot
+/// contain the delimiter char that follows it. ulid ids (Crockford base32) and
+/// date-formatted fields (fixed-length extraction) are always safe; uuid and
+/// nanoid ids contain `-`/`_`, and slugged string/ref values contain `-`, so
+/// placing any of those in a non-terminal position before a colliding
+/// delimiter mis-splits. The terminal field (consuming the rest) is always
+/// safe. Because ids are recovered from paths, not stored, a mis-splittable
+/// template cannot survive index reconstruction from disk — hence this check.
+fn template_extraction_hazard(
+    template: &PathTemplate,
+    def: &CollectionDefinition,
+) -> Option<String> {
+    let segs = &template.segments;
+    for (i, seg) in segs.iter().enumerate() {
+        let (field_name, has_format) = match seg {
+            PathSegment::Field { name, format } => (name.as_str(), format.is_some()),
+            PathSegment::NestedField { parent, .. } => (parent.as_str(), false),
+            PathSegment::Literal(_) => continue,
+        };
+        // Date-format fields extract by fixed length, never scanning for a
+        // delimiter — always safe.
+        if has_format {
+            continue;
+        }
+        // The delimiter that terminates this field's extraction is the first
+        // char of the next literal segment. No following literal => terminal
+        // field (consumes the rest) => safe.
+        let delim = match segs[i + 1..].iter().find_map(|s| match s {
+            PathSegment::Literal(lit) => lit.chars().next(),
+            _ => None,
+        }) {
+            Some(c) => c,
+            None => continue,
+        };
+        if field_alphabet_contains(def, field_name, delim) {
+            return Some(format!(
+                "field '{{{field_name}}}' is non-terminal and followed by '{delim}', \
+                 a character its values can contain — ids/values cannot be recovered \
+                 from the filename unambiguously"
+            ));
+        }
+    }
+    None
+}
+
+/// Whether the value alphabet of `field` in `def` can emit `ch`.
+fn field_alphabet_contains(def: &CollectionDefinition, field: &str, ch: char) -> bool {
+    if field == "id" {
+        match def.auto_id() {
+            // Crockford base32 (lowercased): digits + letters, no separators.
+            Some(AutoIdStrategy::Ulid) => false,
+            // uuid: hex + '-'.
+            Some(AutoIdStrategy::Uuid) => ch == '-' || ch.is_ascii_hexdigit(),
+            // nanoid default alphabet includes '-' and '_'.
+            Some(AutoIdStrategy::Nanoid) => {
+                ch == '-' || ch == '_' || ch.is_ascii_alphanumeric()
+            }
+            // Path-based id: derived from a field value, slugified.
+            None => slug_alphabet_contains(ch),
+        }
+    } else {
+        slug_alphabet_contains(ch)
+    }
+}
+
+/// slug::slugify emits lowercase ascii letters, digits, and '-'.
+fn slug_alphabet_contains(ch: char) -> bool {
+    ch == '-' || ch.is_ascii_lowercase() || ch.is_ascii_digit()
+}
+
 type ViewCallback = Box<dyn Fn(&[serde_json::Value]) + Send>;
 type CollectionCallback = Box<dyn Fn(ChangeEvent) + Send>;
 
@@ -252,6 +327,10 @@ pub struct Store {
     _watcher: Mutex<Option<FileWatcher>>,
     /// Ledger of the store's own file writes, used to suppress watcher echoes.
     self_writes: SelfWriteLedger,
+    /// Collections whose path template can mis-split during path→id extraction
+    /// (U1d). For these, id recovery from a filename is untrusted: reindex /
+    /// rebuild / reconcile are refused rather than risk silent wrong ids.
+    mis_splittable: HashSet<String>,
 }
 
 impl Store {
@@ -300,6 +379,29 @@ impl Store {
             path_templates.insert(name.clone(), template);
         }
 
+        // Detect collections whose template can mis-split during path→id
+        // recovery (U1d). Opening never fails on this — the invariant is "no
+        // silent wrong ids", not "no store opens". Reads always work; only the
+        // reindex/rebuild/reconcile paths refuse for these collections. Warn
+        // loudly so a recovering user understands why reads may be thin.
+        let mut mis_splittable = HashSet::new();
+        for (name, template) in &path_templates {
+            if let Some(def) = schema.collections.get(name) {
+                if let Some(reason) = template_extraction_hazard(template, def) {
+                    mis_splittable.insert(name.clone());
+                    log::warn!(
+                        "Collection '{name}' path template '{}' is mis-splittable: {reason}. \
+                         Reads for this collection reflect only what is already indexed and may \
+                         be empty or incomplete; reindex/rebuild is refused because ids cannot be \
+                         recovered from these filenames unambiguously. Migrate to a terminal-safe \
+                         template (end each field at '/', a date format, or the final field — e.g. \
+                         '{{id}}.md' or '{{status}}/{{title}}.md') and rebuild.",
+                        template.raw
+                    );
+                }
+            }
+        }
+
         let view_engine = ViewEngine::new(&schema)?;
 
         let store = Store {
@@ -312,6 +414,7 @@ impl Store {
             subscriptions: Arc::new(SubscriptionManager::new()),
             _watcher: Mutex::new(None),
             self_writes: SelfWriteLedger::default(),
+            mis_splittable,
         };
 
         store.boot()?;
@@ -468,6 +571,18 @@ impl Store {
     /// Full scan: read all documents in all collections, populate the index
     fn full_scan(&self) -> Result<()> {
         for (name, _collection) in &self.schema.collections {
+            // Skip mis-splittable collections rather than reindex them with
+            // wrong ids (U1d). Boot must still succeed — the invariant is "no
+            // silent wrong ids", not "no store opens". The open-time warning
+            // already explained why this collection's reads may be empty.
+            if self.mis_splittable.contains(name) {
+                log::warn!(
+                    "Skipping reindex of mis-splittable collection '{name}' — ids cannot be \
+                     recovered from its filenames. Its index is left as-is (possibly empty on a \
+                     fresh clone). Migrate to a terminal-safe template and rebuild."
+                );
+                continue;
+            }
             self.scan_collection(name)?;
         }
         Ok(())
@@ -476,6 +591,9 @@ impl Store {
     /// Incremental scan: only scan collections whose directory hash changed
     fn incremental_scan(&self) -> Result<()> {
         for (name, _collection) in &self.schema.collections {
+            if self.mis_splittable.contains(name) {
+                continue; // see full_scan — reindex refused for these
+            }
             let stored_hash = self.db.get_directory_hash(name)?;
             let current_hash = self.compute_collection_hash(name)?;
 
@@ -488,6 +606,16 @@ impl Store {
 
     /// Scan a single collection: read all files, update the document index
     fn scan_collection(&self, name: &str) -> Result<()> {
+        // Explicit reindex of a mis-splittable collection is refused with a
+        // targeted error (U1d) — an explicit request gets an explicit failure,
+        // never silent wrong ids.
+        if self.mis_splittable.contains(name) {
+            return Err(GroundDbError::Other(format!(
+                "Refusing to reindex collection '{name}': its path template is mis-splittable, \
+                 so ids cannot be recovered from filenames unambiguously. Migrate to a \
+                 terminal-safe template and rebuild."
+            )));
+        }
         let collection = &self.schema.collections[name];
         let template = &self.path_templates[name];
         let base_dir = self.root.join(template.base_directory());
@@ -1235,26 +1363,35 @@ impl Store {
         let mut affected_collections = std::collections::HashSet::new();
         for event in &events {
             if let Some(collection_name) = self.collection_for_path(&event.path) {
-                affected_collections.insert(collection_name.clone());
-                if let Err(e) = self.process_single_watcher_event(&collection_name, event) {
-                    let rel_path = event
-                        .path
-                        .strip_prefix(&self.root)
-                        .unwrap_or(&event.path)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    log::warn!(
-                        "Skipping watcher event for {rel_path} in '{collection_name}': {e}"
-                    );
-                    self.subscriptions.notify_collection(
-                        &collection_name,
-                        ChangeEvent::Error {
-                            collection: collection_name.clone(),
-                            path: rel_path,
-                            kind: classify_watcher_error(&e),
-                            message: e.to_string(),
-                        },
-                    );
+                match self.process_single_watcher_event(&collection_name, event) {
+                    // Only a real index change warrants a view rebuild + notify.
+                    // A suppressed own-write echo (or benign/stale no-op) returns
+                    // false, so it no longer triggers a redundant view rebuild
+                    // (U2b — the echo used to fire on_view_change a second time).
+                    Ok(true) => {
+                        affected_collections.insert(collection_name);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        let rel_path = event
+                            .path
+                            .strip_prefix(&self.root)
+                            .unwrap_or(&event.path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        log::warn!(
+                            "Skipping watcher event for {rel_path} in '{collection_name}': {e}"
+                        );
+                        self.subscriptions.notify_collection(
+                            &collection_name,
+                            ChangeEvent::Error {
+                                collection: collection_name.clone(),
+                                path: rel_path,
+                                kind: classify_watcher_error(&e),
+                                message: e.to_string(),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -1303,6 +1440,20 @@ impl Store {
     /// decorated stem like `{id}-{title}.md`. Falls back to the whole file
     /// stem when the template has no `{id}` field or the path doesn't match.
     fn id_for_path(&self, collection: &str, rel_path: &str) -> Option<String> {
+        // Authoritative: the index row keyed by this path. The path is unique
+        // per document, so this recovers the stored id for ANY id strategy
+        // (decorated or not) once the file is indexed — no filename parsing.
+        if let Ok(Some(id)) = self.db.get_id_by_path(collection, rel_path) {
+            return Some(id);
+        }
+        // Not yet indexed. For a mis-splittable collection, deriving the id from
+        // the filename is untrusted (uuid/nanoid/slug can contain the delimiter)
+        // — return None so callers refuse rather than write a wrong id (U1d).
+        if self.mis_splittable.contains(collection) {
+            return None;
+        }
+        // Safe template: recover an explicit {id} via the template, else fall
+        // back to the file stem.
         if let Some(template) = self.path_templates.get(collection) {
             if let Some(extracted) = template.extract(rel_path) {
                 if let Some(id) = extracted.get("id") {
@@ -1331,11 +1482,16 @@ impl Store {
     }
 
     /// Process a single file watcher event: update the document index.
+    /// Process one watcher event against the index. Returns `Ok(true)` if the
+    /// index actually changed (warranting a view rebuild + notify), `Ok(false)`
+    /// if the event was a no-op — a suppressed own-write echo, a benign skip of
+    /// a vanished file, or a stale Remove. This lets `apply_watcher_events`
+    /// avoid a redundant view rebuild for echoes (U2b).
     fn process_single_watcher_event(
         &self,
         collection_name: &str,
         event: &WatcherEvent,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let rel_path = event
             .path
             .strip_prefix(&self.root)
@@ -1354,7 +1510,7 @@ impl Store {
                     if let Ok(raw) = std::fs::read_to_string(&event.path) {
                         let hash = hash_document_bytes(raw.as_bytes());
                         if self.self_writes.take_write(&rel_path, hash) {
-                            return Ok(());
+                            return Ok(false); // own-write echo — no index change
                         }
                     }
 
@@ -1379,7 +1535,12 @@ impl Store {
                     // Reconcile path-extracted values with YAML front matter.
                     // When a file is moved between directories, the path may
                     // encode a new value for a field (e.g. status: published).
-                    if let Some(template) = self.path_templates.get(collection_name) {
+                    // Skip for mis-splittable collections: extraction is
+                    // untrusted there, and rewriting frontmatter from a
+                    // mis-split value would corrupt correct data (U1d/finding 3).
+                    if self.mis_splittable.contains(collection_name) {
+                        // extraction untrusted — do not reconcile
+                    } else if let Some(template) = self.path_templates.get(collection_name) {
                         if let Some(extracted) = template.extract(&rel_path) {
                             let col_def = self.schema.collections.get(collection_name);
                             let mut changed = false;
@@ -1451,12 +1612,22 @@ impl Store {
                         }
                     }
 
-                    // Recover the stored id from the path template so a
-                    // decorated stem doesn't reindex under a divergent id and
-                    // create a duplicate row on reindex.
-                    let id = self
-                        .id_for_path(collection_name, &rel_path)
-                        .unwrap_or_else(|| doc.id.clone());
+                    // Recover the stored id: index-by-path first, template
+                    // fallback for safe collections. For a mis-splittable
+                    // collection whose file isn't indexed yet, id_for_path
+                    // returns None — refuse rather than index under a wrongly
+                    // split id (U1d). Surfaced as a ChangeEvent::Error by the
+                    // fault-isolated drain.
+                    let id = match self.id_for_path(collection_name, &rel_path) {
+                        Some(id) => id,
+                        None => {
+                            return Err(GroundDbError::Other(format!(
+                                "Cannot index {collection_name}/{rel_path}: ids are not \
+                                 recoverable from this collection's mis-splittable path \
+                                 template. Migrate to a terminal-safe template and rebuild."
+                            )));
+                        }
+                    };
                     let created_str = doc.created_at.to_rfc3339();
                     let modified_str = doc.modified_at.to_rfc3339();
                     self.db.upsert_document(
@@ -1483,6 +1654,7 @@ impl Store {
                         }
                     };
                     self.subscriptions.notify_collection(collection_name, change);
+                    return Ok(true); // index changed — rebuild views
                 } else {
                     // The file vanished between the event firing and now — the
                     // stale "from" side of a move, or a rapid re-move (A→B→C)
@@ -1497,7 +1669,7 @@ impl Store {
                 // Own-delete suppression: an API delete/move echoes a Remove for
                 // the old path; consume it.
                 if self.self_writes.take_delete(&rel_path) {
-                    return Ok(());
+                    return Ok(false); // own-delete echo — no index change
                 }
 
                 // Stale-remove guard: only delete the index row if it still
@@ -1514,13 +1686,15 @@ impl Store {
                                 collection_name,
                                 ChangeEvent::Deleted { id },
                             );
+                            return Ok(true); // row removed — rebuild views
                         }
                     }
                 }
             }
         }
 
-        Ok(())
+        // Fell through: benign skip (vanished file) or stale Remove — no change.
+        Ok(false)
     }
 
     /// Called after any write (insert/update/delete) to a collection.
@@ -3644,6 +3818,183 @@ collections:
             .get_document::<serde_json::Value>("tasks", &id)
             .unwrap();
         assert_eq!(typed.id, id);
+    }
+
+    // ── U2b: own-write echo must not trigger a redundant view rebuild ─
+
+    /// An API write fires on_view_change once (the API path). The watcher echo
+    /// of that same write must NOT fire it a second time: the self-write ledger
+    /// suppresses the index mutation, and now also prevents the collection from
+    /// being marked affected, so no redundant view rebuild/notify. (Donovan
+    /// measured 2 fires per write pre-fix — 1 API + 1 echo-rebuild; expect 1.)
+    #[test]
+    fn test_echo_does_not_rebuild_view() {
+        let tmp = TempDir::new().unwrap();
+        let schema = r#"
+collections:
+  tasks:
+    path: "tasks/{status}/{id}.md"
+    id: { auto: ulid }
+    fields:
+      title: { type: string, required: true }
+      status: { type: string, enum: [open, done], default: open }
+    additional_properties: false
+    strict: true
+views:
+  open_tasks:
+    query: "SELECT id, title, status FROM tasks WHERE status != 'done'"
+"#;
+        std::fs::write(tmp.path().join("schema.yaml"), schema).unwrap();
+        let store = Store::open(tmp.path().to_str().unwrap()).unwrap();
+
+        let fires = Arc::new(AtomicU64::new(0));
+        let fires_clone = fires.clone();
+        store.on_view_change(
+            "open_tasks",
+            Box::new(move |_rows| {
+                fires_clone.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+
+        // API write: fires the view once (the API path).
+        let id = store
+            .collection("tasks")
+            .unwrap()
+            .insert(
+                serde_yaml::from_str("title: Wire It\nstatus: open").unwrap(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(fires.load(Ordering::Relaxed), 1, "API write fires the view once");
+
+        // The watcher echo of that write: a Modified event on the same file with
+        // identical content. It must be suppressed and NOT rebuild the view.
+        let rel = store.db.list_documents("tasks").unwrap()[0].path.clone();
+        let abs = tmp.path().join(&rel);
+        store
+            .apply_watcher_events(vec![WatcherEvent {
+                path: abs,
+                kind: ChangeKind::Modified,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            1,
+            "echo must not fire the view a second time (id {id})"
+        );
+    }
+
+    // ── U1d: mis-splittable template detection + reindex refusal ─────
+
+    fn open_schema(schema: &str) -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("schema.yaml"), schema).unwrap();
+        let store = Store::open(tmp.path().to_str().unwrap()).unwrap();
+        (tmp, store)
+    }
+
+    /// The generalized non-terminal-delimiter rule: a field whose value can
+    /// contain the delimiter that follows it makes path→id/value recovery
+    /// ambiguous. ulid (no separators) and date-format (fixed length) are safe;
+    /// uuid/nanoid ids and slugged fields before a literal '-' are not.
+    #[test]
+    fn test_mis_splittable_detection() {
+        // uuid + decorated '-' → hazardous.
+        let (_a, s1) = open_schema(
+            "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: uuid }\n    fields:\n      title: { type: string, required: true }\n",
+        );
+        assert!(s1.mis_splittable.contains("tasks"), "uuid decorated is hazardous");
+
+        // ulid + decorated '-' → SAFE (Crockford base32 has no '-').
+        let (_b, s2) = open_schema(
+            "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n",
+        );
+        assert!(!s2.mis_splittable.contains("tasks"), "ulid decorated is safe");
+
+        // Slugged non-terminal field before '-' → hazardous, ANY id strategy.
+        let (_c, s3) = open_schema(
+            "collections:\n  notes:\n    path: \"notes/{title}-{id}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n",
+        );
+        assert!(s3.mis_splittable.contains("notes"), "{{title}}-{{id}} mis-splits on slug '-'");
+
+        // Terminal fields / '/' and date-format delimiters → SAFE.
+        let (_d, s4) = open_schema(
+            "collections:\n  posts:\n    path: \"posts/{status}/{date:YYYY-MM-DD}-{title}.md\"\n    fields:\n      title: { type: string, required: true }\n      status: { type: string }\n      date: { type: date }\n",
+        );
+        assert!(!s4.mis_splittable.contains("posts"), "terminal/'/'/date delimiters are safe");
+    }
+
+    /// A mis-splittable collection must still OPEN and serve API writes/reads
+    /// (id is known at write time), but an explicit reindex is refused with an
+    /// error rather than producing silent wrong ids. Never locks the user out.
+    #[test]
+    fn test_mis_splittable_open_and_reads_work_reindex_refused() {
+        let (_tmp, store) = open_schema(
+            "collections:\n  tasks:\n    path: \"tasks/{id}-{title}.md\"\n    id: { auto: uuid }\n    fields:\n      title: { type: string, required: true }\n    additional_properties: false\n    strict: true\n",
+        );
+
+        // API write works (id known via determine_id, no extraction).
+        let id = store
+            .collection("tasks")
+            .unwrap()
+            .insert(serde_yaml::from_str("title: Ship It").unwrap(), None)
+            .unwrap();
+        // Read works and returns the bare uuid.
+        let got = store.get_dynamic("tasks", &id).unwrap();
+        assert_eq!(got["id"], serde_json::Value::String(id.clone()));
+
+        // Explicit reindex is refused (would need to recover id from filename).
+        assert!(
+            store.rebuild(Some("tasks")).is_err(),
+            "reindex of a mis-splittable collection must be refused"
+        );
+    }
+
+    /// Reconcile weaponization (Arabella finding #3): on a `{title}-{id}` shape,
+    /// extract mis-splits the title, and the directory-wins reconcile would
+    /// otherwise overwrite CORRECT front matter with the mis-split value. For a
+    /// mis-splittable collection reconcile is skipped, so front matter is safe.
+    #[test]
+    fn test_mis_splittable_reconcile_does_not_corrupt_frontmatter() {
+        let (tmp, store) = open_schema(
+            "collections:\n  notes:\n    path: \"notes/{title}-{id}.md\"\n    id: { auto: ulid }\n    fields:\n      title: { type: string, required: true }\n      body: { type: string }\n    additional_properties: false\n    strict: true\n",
+        );
+        assert!(store.mis_splittable.contains("notes"));
+
+        store
+            .collection("notes")
+            .unwrap()
+            .insert(serde_yaml::from_str("title: Ship It\nbody: draft").unwrap(), None)
+            .unwrap();
+        let rel = store.db.list_documents("notes").unwrap()[0].path.clone();
+        let abs = tmp.path().join(&rel);
+
+        // External edit of the body only (a genuine change, so not suppressed as
+        // our own write) — this would trigger reconcile on a normal collection.
+        let doc = document::read_document(&abs).unwrap();
+        let mut d = doc.data.clone();
+        d.as_mapping_mut().unwrap().insert(
+            serde_yaml::Value::String("body".into()),
+            serde_yaml::Value::String("edited".into()),
+        );
+        document::write_document(&abs, &d, None).unwrap();
+
+        store
+            .apply_watcher_events(vec![WatcherEvent {
+                path: abs.clone(),
+                kind: ChangeKind::Modified,
+            }])
+            .unwrap();
+
+        // Front matter title is preserved — reconcile did NOT rewrite the
+        // correct "Ship It" to the mis-split "ship".
+        let after = document::read_document(&abs).unwrap();
+        assert_eq!(
+            after.data["title"],
+            serde_yaml::Value::String("Ship It".into()),
+            "reconcile must not corrupt front matter on a mis-splittable template"
+        );
     }
 
     // ── Issue 3: watcher-path validation + non-aborting drain ────────

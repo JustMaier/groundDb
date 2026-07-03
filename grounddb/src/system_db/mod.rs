@@ -203,6 +203,22 @@ impl SystemDb {
         Ok(result)
     }
 
+    /// Look up a document's id by its root-relative path. The path is unique
+    /// per document, so this is the authoritative way to recover the stored id
+    /// for an already-indexed file — used by id derivation to avoid re-parsing
+    /// the id out of a (possibly ambiguous) filename.
+    pub fn get_id_by_path(&self, collection: &str, path: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        let result = conn
+            .query_row(
+                "SELECT id FROM documents WHERE collection = ?1 AND path = ?2",
+                params![collection, path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
     /// List all documents in a collection.
     pub fn list_documents(&self, collection: &str) -> Result<Vec<DocumentRecord>> {
         let conn = self.conn();
