@@ -93,8 +93,13 @@ views:
 > and `_`) or place a multi-word/slugged field before a literal `-` in a
 > non-terminal position; those can mis-split on reindex. Templates that end each
 > field at `/`, a date format, or the terminal field (e.g.
-> `{status}/{date:YYYY-MM-DD}-{title}.md`) are safe with any id strategy. A
-> schema-load check to enforce this is planned.
+> `{status}/{date:YYYY-MM-DD}-{title}.md`) are safe with any id strategy.
+>
+> This is now **enforced at load**: a mis-splittable template with no existing
+> documents is rejected when the store opens; one that already has documents on
+> disk opens with a loud warning and refuses reindex/rebuild/reconcile for that
+> collection (so you are never locked out of data you need to migrate). API
+> writes and reads keep working; migrate to a terminal-safe template and rebuild.
 
 ### Set up code generation
 
