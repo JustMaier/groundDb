@@ -5,6 +5,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// How long a connection retries a lock held by another connection before
+/// giving up with `SQLITE_BUSY`.
+///
+/// This happens to match the default rusqlite installs on every connection, but
+/// we set it explicitly: that default is an implementation detail of the
+/// dependency, and the correctness of multi-process access should not silently
+/// change when rusqlite is upgraded.
+pub const BUSY_TIMEOUT_MS: u64 = 5000;
+
 /// The system database that manages document index, schema state, and view cache.
 /// Uses a Mutex around the connection so Store can be Send + Sync.
 pub struct SystemDb {
@@ -15,6 +24,7 @@ impl SystemDb {
     /// Open or create the system database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        Self::configure(&conn, true)?;
         let db = SystemDb { conn: Mutex::new(conn) };
         db.initialize_tables()?;
         Ok(db)
@@ -23,13 +33,85 @@ impl SystemDb {
     /// Open an in-memory system database (for testing).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        Self::configure(&conn, false)?;
         let db = SystemDb { conn: Mutex::new(conn) };
         db.initialize_tables()?;
         Ok(db)
     }
 
+    /// Apply connection-level pragmas. Must run before any statement that opens
+    /// a transaction, because `journal_mode` cannot be changed inside one.
+    ///
+    /// ## What WAL buys us, and what it does not
+    ///
+    /// The store is reachable from more than one OS process. The `Mutex` around
+    /// the connection is an *in-process* lock — it exists so `Store` can be
+    /// `Send + Sync` — so between processes the only arbiter is SQLite itself.
+    ///
+    /// In the default rollback-journal mode a writer's `RESERVED` lock escalates
+    /// to `EXCLUSIVE` at commit, which locks readers out, and a reader that is
+    /// already mid-statement can force the writer to fail. WAL removes that
+    /// contention in one direction only: **readers never block writers and
+    /// writers never block readers**, because readers work from a snapshot.
+    ///
+    /// WAL does *not* make multi-process writing free:
+    ///
+    /// - **Writers are still serialized.** Exactly one write transaction may be
+    ///   in flight per database. The improvement is that a second writer now
+    ///   *waits* out the [`BUSY_TIMEOUT_MS`] window instead of erroring
+    ///   immediately — and it still errors if the holder outlives that window.
+    /// - **WAL needs shared memory.** It coordinates through a `-shm` file
+    ///   mapped by every connection, so it does not work over network
+    ///   filesystems (NFS, SMB, most container/VM shares). SQLite will refuse to
+    ///   enter WAL there, which is why the mode is read back rather than
+    ///   assumed.
+    /// - **Two extra files appear** next to the database (`-wal` and `-shm`).
+    ///   Anything that copies or deletes the store must treat them as part of it.
+    ///
+    /// WAL is meaningless for an in-memory database — there is no second process
+    /// to share it with and no file to map — so it is only requested on disk.
+    fn configure(conn: &Connection, on_disk: bool) -> Result<()> {
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+
+        if on_disk {
+            // `PRAGMA journal_mode` returns the mode actually in effect, which
+            // may not be the one asked for (a network filesystem cannot do WAL).
+            // Reading it back keeps a silent downgrade from looking like success
+            // — the store still works, just with the old contention behaviour.
+            let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                log::warn!(
+                    "system db could not enter WAL mode (still '{mode}'); \
+                     concurrent access will contend as before. \
+                     This is expected on network filesystems."
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// The journal mode this connection is running in (`"wal"`, `"memory"`,
+    /// `"delete"`, …). Exposed for diagnostics and tests.
+    pub fn journal_mode(&self) -> Result<String> {
+        let mode = self
+            .conn()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode)
+    }
+
+    /// How long, in milliseconds, this connection will retry a lock held by
+    /// another connection before giving up with `SQLITE_BUSY`. Exposed for
+    /// diagnostics and tests.
+    pub fn busy_timeout_ms(&self) -> Result<i64> {
+        let ms = self
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
+        Ok(ms)
     }
 
     fn initialize_tables(&self) -> Result<()> {
@@ -360,8 +442,21 @@ impl SystemDb {
     // ── Transaction Support ──────────────────────────────────────────
 
     /// Begin a transaction.
+    ///
+    /// `IMMEDIATE`, not the SQLite default of `DEFERRED`, because every caller
+    /// here is about to write. A deferred transaction takes no lock until its
+    /// first statement, so one that reads before it writes — which
+    /// `Batch::commit` does, reading each document to save its file for
+    /// rollback — has to *upgrade* to a write lock later. If another connection
+    /// committed in between, that upgrade fails with `SQLITE_BUSY_SNAPSHOT`
+    /// (extended code 517), and the busy timeout does **not** retry it: the read
+    /// already saw a snapshot that can no longer be extended, so waiting cannot
+    /// help. It fails instantly no matter how long the timeout is.
+    ///
+    /// `IMMEDIATE` takes the write lock up front, where the busy timeout does
+    /// apply, so a contended batch waits instead of erroring.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.conn().execute_batch("BEGIN TRANSACTION")?;
+        self.conn().execute_batch("BEGIN IMMEDIATE")?;
         Ok(())
     }
 

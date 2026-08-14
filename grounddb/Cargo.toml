@@ -33,3 +33,7 @@ notify = { version = "6", features = [] }
 [dev-dependencies]
 tempfile = "3"
 pretty_assertions = "1"
+serde_yaml = "0.9"
+# Used by tests/concurrent_access.rs to hold a genuine read-only transaction,
+# which SystemDb's own (write-)transaction API deliberately cannot express.
+rusqlite = { version = "0.31", features = ["bundled"] }
