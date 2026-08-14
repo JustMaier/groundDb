@@ -22,6 +22,30 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
 
+/// One file on disk as the boot scan sees it, before deciding whether it needs
+/// reading. Cheap to build — a stat, no file contents.
+struct ScanEntry {
+    /// Absolute path, for reading the document.
+    abs: PathBuf,
+    /// Root-relative path with forward slashes: what the index stores.
+    rel: String,
+    /// mtime rendered the way `documents.modified_at` stores it, so the two
+    /// compare directly.
+    modified_at: String,
+    /// mtime at full resolution, for the collection hash.
+    mtime_nanos: u64,
+}
+
+/// The collection hash over a scanned directory — the value boot compares
+/// against the stored one to decide whether anything moved at all.
+fn hash_entries(entries: &[ScanEntry]) -> String {
+    let pairs: Vec<(String, u64)> = entries
+        .iter()
+        .map(|e| (e.rel.clone(), e.mtime_nanos))
+        .collect();
+    compute_directory_hash(&pairs)
+}
+
 /// Classifies a failure encountered while ingesting a watcher event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatcherErrorKind {
@@ -632,20 +656,153 @@ impl Store {
         Ok(())
     }
 
-    /// Incremental scan: only scan collections whose directory hash changed
+    /// Incremental scan: reconcile each collection's index with what is on disk,
+    /// touching only the files that actually changed while the process was down.
+    ///
+    /// The collection hash is still the first gate — when it matches, nothing in
+    /// the directory moved and the collection is skipped without reading a
+    /// single document. When it does *not* match, the collection is **not**
+    /// re-indexed wholesale: [`Store::sync_collection`] diffs per file. That
+    /// distinction is the whole point. A mailbox gains a message every few
+    /// minutes, so the hash almost never matches, and a whole-collection
+    /// re-index on every boot made startup cost scale with total mail ever
+    /// received rather than with mail received since the last boot.
     fn incremental_scan(&self) -> Result<()> {
         for (name, _collection) in &self.schema.collections {
             if self.mis_splittable.contains(name) {
                 continue; // see full_scan — reindex refused for these
             }
-            let stored_hash = self.db.get_directory_hash(name)?;
-            let current_hash = self.compute_collection_hash(name)?;
-
-            if stored_hash.as_deref() != Some(&current_hash) {
+            let base_dir = self.root.join(self.path_templates[name].base_directory());
+            if !base_dir.exists() {
+                // scan_collection owns creating the directory and recording the
+                // empty hash; there is nothing to diff against.
                 self.scan_collection(name)?;
+                continue;
             }
+
+            let entries = self.collection_entries(name)?;
+            let current_hash = hash_entries(&entries);
+            if self.db.get_directory_hash(name)?.as_deref() == Some(&current_hash) {
+                continue;
+            }
+            self.sync_collection(name, &entries, &current_hash)?;
         }
         Ok(())
+    }
+
+    /// Reconcile one collection's index against `entries`, the files currently on
+    /// disk, re-reading only what changed.
+    ///
+    /// The stored `modified_at` of each indexed document is the mtime the
+    /// indexer saw when it last read that file, so comparing it to the file's
+    /// current mtime answers "does this document need re-reading?" without
+    /// opening the file. Paths that vanished are deleted; paths that appeared or
+    /// whose mtime moved are re-read.
+    ///
+    /// ## Why duplicate ids are force-refreshed
+    ///
+    /// Two files can map to the same document id — `{recipient}/{id}.md` allows
+    /// the same message id under two recipients — and the index is keyed by
+    /// `(collection, id)`, so only the last one written survives. A full scan
+    /// resolves that by glob order. A pure change-diff would resolve it by
+    /// *which file happened to change*, which is a different answer. So any id
+    /// claimed by more than one file on disk has all of its files re-written, in
+    /// glob order, leaving the same winner a full rescan would leave.
+    fn sync_collection(&self, name: &str, entries: &[ScanEntry], hash: &str) -> Result<()> {
+        let indexed = self.db.list_document_index_entries(name)?;
+
+        let on_disk: HashSet<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+        let mut indexed_by_path: HashMap<&str, Option<&str>> = HashMap::new();
+        let mut removed_ids: Vec<&str> = Vec::new();
+        for (id, path, modified_at) in &indexed {
+            if on_disk.contains(path.as_str()) {
+                indexed_by_path.insert(path.as_str(), modified_at.as_deref());
+            } else {
+                removed_ids.push(id.as_str());
+            }
+        }
+
+        // Ids claimed by more than one file — see the doc comment above.
+        let derived: Vec<Option<String>> = entries
+            .iter()
+            .map(|entry| self.path_derived_id(name, &entry.rel))
+            .collect();
+        let mut id_counts: HashMap<&str, usize> = HashMap::new();
+        for id in derived.iter().flatten() {
+            *id_counts.entry(id.as_str()).or_default() += 1;
+        }
+
+        let stale: Vec<&ScanEntry> = entries
+            .iter()
+            .zip(&derived)
+            .filter(|(entry, id)| {
+                let contested = id
+                    .as_deref()
+                    .is_some_and(|id| id_counts.get(id).copied().unwrap_or(0) > 1);
+                contested
+                    || match indexed_by_path.get(entry.rel.as_str()) {
+                        Some(Some(seen)) => *seen != entry.modified_at,
+                        // Never indexed, or indexed before mtimes were recorded.
+                        _ => true,
+                    }
+            })
+            .map(|(entry, _)| entry)
+            .collect();
+
+        self.db.begin_transaction()?;
+        let result = (|| -> Result<()> {
+            // Deletions run first: a file moved from one path to another shows up
+            // as both a removed path and an added one, and they share an id. An
+            // insert-then-delete order would file the new path and then delete
+            // the row it had just written.
+            for id in &removed_ids {
+                self.db.delete_document(name, id)?;
+            }
+            for entry in &stale {
+                self.index_entry(name, entry)?;
+            }
+            self.db.set_directory_hash(name, hash)?;
+            Ok(())
+        })();
+
+        self.commit_or_rollback(result)
+    }
+
+    /// Read one file and write its index row.
+    fn index_entry(&self, name: &str, entry: &ScanEntry) -> Result<()> {
+        let doc = document::read_document(&entry.abs)?;
+
+        // Derive the id by reverse-mapping the path through the template
+        // so a decorated stem like `{id}-{title}.md` recovers the stored
+        // `{id}` (matching what insert wrote) instead of indexing the whole
+        // stem as a second, divergent id.
+        let id = self
+            .id_for_path(name, &entry.rel)
+            .unwrap_or_else(|| doc.id.clone());
+        let created_str = doc.created_at.to_rfc3339();
+        self.db.upsert_document(
+            &id,
+            name,
+            &entry.rel,
+            &doc.data,
+            Some(&created_str),
+            Some(&entry.modified_at),
+            doc.content.as_deref(),
+        )
+    }
+
+    /// Commit the open transaction, or roll it back and surface the original
+    /// error. The rollback's own result is discarded deliberately: it can only
+    /// fail if the transaction is already gone, and reporting that instead of
+    /// what actually went wrong would bury the real error.
+    fn commit_or_rollback(&self, result: Result<()>) -> Result<()> {
+        match result {
+            Ok(()) => self.db.commit_transaction(),
+            Err(err) => {
+                let _ = self.db.rollback_transaction();
+                Err(err)
+            }
+        }
     }
 
     /// Scan a single collection: read all files, update the document index
@@ -660,7 +817,6 @@ impl Store {
                  terminal-safe template and rebuild."
             )));
         }
-        let collection = &self.schema.collections[name];
         let template = &self.path_templates[name];
         let base_dir = self.root.join(template.base_directory());
 
@@ -672,74 +828,36 @@ impl Store {
             return Ok(());
         }
 
-        // Find all matching files recursively
-        let ext = collection.file_extension();
-        let pattern = format!("{}/**/*.{}", base_dir.display(), ext);
-        let files: Vec<PathBuf> = glob::glob(&pattern)
-            .map_err(|e| GroundDbError::Other(format!("Glob error: {e}")))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let entries = self.collection_entries(name)?;
+        let hash = hash_entries(&entries);
 
-        // Clear existing documents for this collection and re-index
-        self.db.delete_collection_documents(name)?;
+        // One transaction for the whole re-index. Outside one, SQLite gives each
+        // `upsert_document` its own implicit commit — a durable write per
+        // document, which is what made re-indexing a six-thousand-message
+        // mailbox take minutes rather than seconds.
+        self.db.begin_transaction()?;
+        let result = (|| -> Result<()> {
+            // Clear existing documents for this collection and re-index
+            self.db.delete_collection_documents(name)?;
+            for entry in &entries {
+                self.index_entry(name, entry)?;
+            }
+            self.db.set_directory_hash(name, &hash)?;
+            Ok(())
+        })();
 
-        let mut entries = Vec::new();
-        for file_path in &files {
-            let doc = document::read_document(file_path)?;
-            let rel_path = file_path
-                .strip_prefix(&self.root)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .replace('\\', "/");
-
-            // Derive the id by reverse-mapping the path through the template
-            // so a decorated stem like `{id}-{title}.md` recovers the stored
-            // `{id}` (matching what insert wrote) instead of indexing the whole
-            // stem as a second, divergent id.
-            let id = self
-                .id_for_path(name, &rel_path)
-                .unwrap_or_else(|| doc.id.clone());
-            let created_str = doc.created_at.to_rfc3339();
-            let modified_str = doc.modified_at.to_rfc3339();
-            self.db.upsert_document(
-                &id,
-                name,
-                &rel_path,
-                &doc.data,
-                Some(&created_str),
-                Some(&modified_str),
-                doc.content.as_deref(),
-            )?;
-
-            let mtime = std::fs::metadata(file_path)?
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            entries.push((
-                file_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                mtime,
-            ));
-        }
-
-        let hash = compute_directory_hash(&entries);
-        self.db.set_directory_hash(name, &hash)?;
-
-        Ok(())
+        self.commit_or_rollback(result)
     }
 
-    /// Compute the current directory hash for a collection
-    fn compute_collection_hash(&self, name: &str) -> Result<String> {
+    /// Every file belonging to a collection, in glob order, with the two facts
+    /// the scan needs about each: where it is and when it last changed.
+    fn collection_entries(&self, name: &str) -> Result<Vec<ScanEntry>> {
         let collection = &self.schema.collections[name];
         let template = &self.path_templates[name];
         let base_dir = self.root.join(template.base_directory());
 
         if !base_dir.exists() {
-            return Ok(compute_directory_hash(&[]));
+            return Ok(Vec::new());
         }
 
         let ext = collection.file_extension();
@@ -749,24 +867,60 @@ impl Store {
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut entries = Vec::new();
-        for file_path in &files {
-            let mtime = std::fs::metadata(&file_path)?
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            entries.push((
-                file_path
-                    .file_name()
+        let mut entries = Vec::with_capacity(files.len());
+        for abs in files {
+            let mtime = std::fs::metadata(&abs)?.modified()?;
+            let rel = abs
+                .strip_prefix(&self.root)
+                .unwrap_or(&abs)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let modified: chrono::DateTime<chrono::Utc> = mtime.into();
+            entries.push(ScanEntry {
+                abs,
+                rel,
+                // Rendered exactly the way every `upsert_document` caller renders
+                // it, so a stored `modified_at` and a fresh stat compare as
+                // strings with no reparsing.
+                modified_at: modified.to_rfc3339(),
+                mtime_nanos: mtime
+                    .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                mtime,
-            ));
+                    .as_nanos() as u64,
+            });
         }
 
-        Ok(compute_directory_hash(&entries))
+        Ok(entries)
+    }
+
+    /// The document id a path implies, derived from the path alone — no index
+    /// lookup, so it is safe to call for every file in a collection. This is the
+    /// fallback half of [`Store::id_for_path`].
+    fn path_derived_id(&self, collection: &str, rel_path: &str) -> Option<String> {
+        // For a mis-splittable collection, deriving the id from the filename is
+        // untrusted (uuid/nanoid/slug can contain the delimiter) — return None
+        // so callers refuse rather than write a wrong id (U1d).
+        if self.mis_splittable.contains(collection) {
+            return None;
+        }
+        // Safe template: recover an explicit {id} via the template, else fall
+        // back to the file stem.
+        if let Some(template) = self.path_templates.get(collection) {
+            if let Some(extracted) = template.extract(rel_path) {
+                if let Some(id) = extracted.get("id") {
+                    return Some(id.clone());
+                }
+            }
+        }
+        Path::new(rel_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Compute the current directory hash for a collection
+    fn compute_collection_hash(&self, name: &str) -> Result<String> {
+        Ok(hash_entries(&self.collection_entries(name)?))
     }
 
     /// Get a dynamic collection handle (uses serde_yaml::Value as the data type)
@@ -1496,25 +1650,8 @@ impl Store {
         if let Ok(Some(id)) = self.db.get_id_by_path(collection, rel_path) {
             return Some(id);
         }
-        // Not yet indexed. For a mis-splittable collection, deriving the id from
-        // the filename is untrusted (uuid/nanoid/slug can contain the delimiter)
-        // — return None so callers refuse rather than write a wrong id (U1d).
-        if self.mis_splittable.contains(collection) {
-            return None;
-        }
-        // Safe template: recover an explicit {id} via the template, else fall
-        // back to the file stem.
-        if let Some(template) = self.path_templates.get(collection) {
-            if let Some(extracted) = template.extract(rel_path) {
-                if let Some(id) = extracted.get("id") {
-                    return Some(id.clone());
-                }
-            }
-        }
-        Path::new(rel_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
+        // Not yet indexed — fall back to what the path itself says.
+        self.path_derived_id(collection, rel_path)
     }
 
     /// Determine which collection a file path belongs to.

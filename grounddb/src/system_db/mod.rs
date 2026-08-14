@@ -62,6 +62,17 @@ impl SystemDb {
 
             CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
             CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection);
+            -- Both equality columns of the by-path lookup, in one index.
+            --
+            -- Without it the planner is free to satisfy
+            -- `WHERE collection = ? AND path = ?` through idx_documents_collection,
+            -- and it does. Every document in a store shares one collection, so
+            -- that index selects the entire table and the path is then checked
+            -- row by row: one lookup costs O(rows), and a scan that does a lookup
+            -- per file costs O(rows^2). On a 6,800-document store that was ~87s
+            -- of an ~90s boot.
+            CREATE INDEX IF NOT EXISTS idx_documents_collection_path
+                ON documents(collection, path);
 
             CREATE TABLE IF NOT EXISTS view_data (
                 view_name TEXT PRIMARY KEY,
@@ -239,6 +250,36 @@ impl SystemDb {
             docs.push(row?);
         }
         Ok(docs)
+    }
+
+    /// Every indexed document in a collection as `(id, path, modified_at)`.
+    ///
+    /// This is what the boot scan diffs the directory against: `path` identifies
+    /// the file and `modified_at` is the mtime the indexer last saw it with,
+    /// written by every `upsert_document` caller as `metadata.modified()`
+    /// rendered to RFC 3339. Rows predating that column carry `None`, which the
+    /// scan treats as "unknown, re-read it".
+    ///
+    /// Deliberately does not select `data_json` or `content_text`: the scan only
+    /// needs to decide *whether* to re-read a file, and those two columns are
+    /// the whole weight of the table.
+    pub fn list_document_index_entries(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, modified_at FROM documents WHERE collection = ?1",
+        )?;
+        let rows = stmt.query_map(params![collection], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
     }
 
     /// Delete a document from the index.
@@ -462,8 +503,14 @@ impl DocumentRecord {
     }
 }
 
-/// Compute a directory hash from a list of (filename, mtime) pairs.
+/// Compute a directory hash from a list of `(path, mtime)` pairs.
 /// Used for change detection during boot.
+///
+/// The path must be the collection-relative one, not the bare file name: a file
+/// moved between two subdirectories keeps its name and its mtime, so a hash over
+/// names alone reports "nothing changed" for a move. The mtime should likewise
+/// be the finest resolution available — at whole-second granularity a rewrite
+/// inside the same second is invisible here, and boot skips the collection.
 pub fn compute_directory_hash(entries: &[(String, u64)]) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
