@@ -287,13 +287,28 @@ fn parse_view_query(name: &str, view_def: &ViewDefinition) -> Result<ParsedView>
         })
         .unwrap_or(1.0);
 
-    // Determine if this is a query template
-    let is_query_template = view_def.view_type == Some(ViewType::Query);
-    let param_names = view_def
+    let param_names: Vec<String> = view_def
         .params
         .as_ref()
         .map(|p| p.keys().cloned().collect())
         .unwrap_or_default();
+
+    // Determine if this is a query template.
+    //
+    // An explicit `type: query` says so. So does a `params:` block. But so does
+    // the SQL itself: a view whose query carries `:named` placeholders can only
+    // be answered with values supplied at call time, and materialising it binds
+    // every placeholder to NULL — `WHERE recipient = NULL` matches nothing, so
+    // the view stores `[]` and every rebuild rewrites that same `[]`. Left
+    // undeclared, such a view was treated as static and rebuilt on every boot
+    // and every write, at real cost, to recompute a value that cannot be right.
+    //
+    // `clean_sql != sql` is precisely "replace_params changed something", which
+    // is the same placeholder detection the parser above already relies on — so
+    // classification and parsing can never disagree about what a param is.
+    let is_query_template = view_def.view_type == Some(ViewType::Query)
+        || !param_names.is_empty()
+        || clean_sql != sql;
 
     Ok(ParsedView {
         name: name.to_string(),
