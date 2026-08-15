@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-14
+
+Boot and write cost no longer scale with how much data a collection already
+holds. On a 6,800-document store, opening went from 154s to under 3s and a
+single write went from ~990ms to ~6ms.
+
+### Added
+
+- `(collection, path)` composite index on the document index. `get_id_by_path`
+  filters on both columns, and with only single-column indexes the planner chose
+  the collection index — which matches every row, because a store has one
+  collection. Each id lookup was O(rows) and the boot scan does one per file.
+- `collection_entries` table mirroring each file's `(path, mtime)`, so a write
+  updates one row instead of restating the directory.
+
+### Changed
+
+- The boot scan re-reads only files whose mtime moved, instead of deleting and
+  re-reading every document in the collection on any change.
+- The re-index runs in a single transaction. Outside one, SQLite gives each
+  document its own durable commit.
+- `post_write` derives the collection hash from the mirrored entry set rather
+  than globbing the collection and calling `metadata()` once per file. Boot
+  still derives the hash from disk, so a stale mirror costs a rescan and never a
+  wrong index; the watcher, which ingests other processes' edits and cannot know
+  what moved, still restates from disk.
+
+### Fixed
+
+- Views whose SQL carries `:named` placeholders are no longer treated as static.
+  Materialising one binds every placeholder to NULL, so it stored `[]` and every
+  boot and every write rebuilt that same `[]`. They are query templates whether
+  or not the schema declares `type: query` or a `params:` block.
+- The boot scan could not see two kinds of change, because its directory hash
+  keyed on bare filenames at whole-second resolution: a file moved between
+  subdirectories (same name, same mtime), and an edit landing in the same second
+  as the previous one. It now keys on the collection-relative path at full mtime
+  resolution.
+- SQLite runs in WAL mode with an explicit busy timeout and IMMEDIATE write
+  transactions.
+
+## [1.2.0] and [1.1.0]
+
+Released without changelog entries. What follows sat under `[Unreleased]` until
+1.3.0 was cut, so it describes work that had already shipped across these two
+versions. It is grouped here rather than split between them, because which half
+landed in which release was not recorded at the time.
+
 ### Added
 
 - SQL view execution engine with CTE-rewriting: view SQL is parsed, wrapped in CTEs that extract fields via `json_extract()`, and executed against the SQLite documents table
