@@ -173,6 +173,13 @@ impl SystemDb {
                 hash TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS collection_entries (
+                collection TEXT NOT NULL,
+                path TEXT NOT NULL,
+                mtime_nanos INTEGER NOT NULL,
+                PRIMARY KEY (collection, path)
+            );
             "
         )?;
         // Migrate existing documents table: add columns if missing
@@ -429,6 +436,97 @@ impl SystemDb {
         self.conn().execute(
             "INSERT OR REPLACE INTO directory_hashes (collection, hash) VALUES (?1, ?2)",
             params![collection, hash],
+        )?;
+        Ok(())
+    }
+
+    // ── Collection Entries ───────────────────────────────────────────
+    //
+    // The (path, mtime) set the directory hash is computed from, mirrored into
+    // the database so a write can update one row instead of restating the whole
+    // directory from the filesystem. Boot still derives the hash from disk, so a
+    // drifted table costs a rescan, never a wrong index.
+
+    /// Every (path, mtime) pair recorded for a collection, path-ascending.
+    pub fn collection_entries(&self, collection: &str) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT path, mtime_nanos FROM collection_entries WHERE collection = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![collection], |row| {
+            let path: String = row.get(0)?;
+            // SQLite integers are signed; mtimes are stored as the same u64 bit
+            // pattern they were written with and cast back here.
+            let mtime: i64 = row.get(1)?;
+            Ok((path, mtime as u64))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Replace a collection's entry set wholesale, as one atomic unit.
+    ///
+    /// Uses a SAVEPOINT rather than a transaction because the boot scan calls
+    /// this from *inside* its own transaction, and SQLite refuses a nested
+    /// `BEGIN`. A savepoint nests, and outside a transaction it behaves like one
+    /// — so the standalone reseed still gets a single commit rather than one
+    /// per row.
+    pub fn replace_collection_entries(
+        &self,
+        collection: &str,
+        entries: &[(String, u64)],
+    ) -> Result<()> {
+        let conn = self.conn();
+        conn.execute_batch("SAVEPOINT gdb_replace_entries")?;
+        let result = (|| -> Result<()> {
+            conn.execute(
+                "DELETE FROM collection_entries WHERE collection = ?1",
+                params![collection],
+            )?;
+            let mut stmt = conn.prepare(
+                "INSERT OR REPLACE INTO collection_entries (collection, path, mtime_nanos) VALUES (?1, ?2, ?3)",
+            )?;
+            for (path, mtime) in entries {
+                stmt.execute(params![collection, path, *mtime as i64])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("RELEASE gdb_replace_entries")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO gdb_replace_entries; RELEASE gdb_replace_entries",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Record one file's current mtime.
+    pub fn upsert_collection_entry(
+        &self,
+        collection: &str,
+        path: &str,
+        mtime_nanos: u64,
+    ) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO collection_entries (collection, path, mtime_nanos) VALUES (?1, ?2, ?3)",
+            params![collection, path, mtime_nanos as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one file.
+    pub fn delete_collection_entry(&self, collection: &str, path: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM collection_entries WHERE collection = ?1 AND path = ?2",
+            params![collection, path],
         )?;
         Ok(())
     }

@@ -46,6 +46,34 @@ fn hash_entries(entries: &[ScanEntry]) -> String {
     compute_directory_hash(&pairs)
 }
 
+/// A file's mtime at the resolution the collection hash uses.
+fn mtime_nanos(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_default()
+}
+
+/// What a write did to the file set, as the writer already knows it.
+///
+/// The collection hash is a function of every file's path and mtime. Deriving
+/// it by restating the directory costs one `metadata()` syscall per file — on a
+/// 6,800-message mail store that was ~700ms **per write**, so the cost of
+/// sending a message scaled with how much mail already existed.
+///
+/// A writer does not need to ask the filesystem what it just did. It knows the
+/// path it wrote and the mtime it read back, so it can update one row of the
+/// mirrored entry set and hash that instead.
+#[derive(Debug, Clone)]
+enum EntryChange {
+    /// A file was created or rewritten at `rel`, with this mtime.
+    Written { rel: String, mtime_nanos: u64 },
+    /// A file at `rel` no longer exists.
+    Removed { rel: String },
+}
+
+
 /// Classifies a failure encountered while ingesting a watcher event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatcherErrorKind {
@@ -683,6 +711,14 @@ impl Store {
             let entries = self.collection_entries(name)?;
             let current_hash = hash_entries(&entries);
             if self.db.get_directory_hash(name)?.as_deref() == Some(&current_hash) {
+                // Index is in sync. The entry mirror still might not be — an
+                // older store predates it, and writes derive the hash from it.
+                // Reseed only when it actually disagrees, so an unchanged boot
+                // stays a read.
+                let mirrored = compute_directory_hash(&self.db.collection_entries(name)?);
+                if mirrored != current_hash {
+                    self.persist_entries(name, &entries)?;
+                }
                 continue;
             }
             self.sync_collection(name, &entries, &current_hash)?;
@@ -761,6 +797,7 @@ impl Store {
             for entry in &stale {
                 self.index_entry(name, entry)?;
             }
+            self.persist_entries(name, entries)?;
             self.db.set_directory_hash(name, hash)?;
             Ok(())
         })();
@@ -823,6 +860,7 @@ impl Store {
         if !base_dir.exists() {
             // Collection directory doesn't exist yet -- create it
             std::fs::create_dir_all(&base_dir)?;
+            self.db.replace_collection_entries(name, &[])?;
             self.db
                 .set_directory_hash(name, &compute_directory_hash(&[]))?;
             return Ok(());
@@ -842,6 +880,7 @@ impl Store {
             for entry in &entries {
                 self.index_entry(name, entry)?;
             }
+            self.persist_entries(name, &entries)?;
             self.db.set_directory_hash(name, &hash)?;
             Ok(())
         })();
@@ -919,8 +958,18 @@ impl Store {
     }
 
     /// Compute the current directory hash for a collection
-    fn compute_collection_hash(&self, name: &str) -> Result<String> {
-        Ok(hash_entries(&self.collection_entries(name)?))
+    /// Mirror a disk-derived entry set into the database, so later writes can
+    /// update one row instead of restating the directory.
+    ///
+    /// Always paired with storing the hash these same entries produce: the
+    /// mirror and the stored hash have to describe the same file set, or the
+    /// first incremental write would derive a hash from a set boot never saw.
+    fn persist_entries(&self, name: &str, entries: &[ScanEntry]) -> Result<()> {
+        let pairs: Vec<(String, u64)> = entries
+            .iter()
+            .map(|e| (e.rel.clone(), e.mtime_nanos))
+            .collect();
+        self.db.replace_collection_entries(name, &pairs)
     }
 
     /// Get a dynamic collection handle (uses serde_yaml::Value as the data type)
@@ -1602,7 +1651,13 @@ impl Store {
 
         // Rebuild affected views
         for collection_name in &affected_collections {
-            let hash = self.compute_collection_hash(collection_name)?;
+            // These changes came from outside this process, so the batch cannot
+            // say which paths moved — restate from disk. That is the expensive
+            // path, but it only runs when something else touched the tree, and
+            // the mirror is refreshed alongside the hash so the two agree.
+            let entries = self.collection_entries(collection_name)?;
+            let hash = hash_entries(&entries);
+            self.persist_entries(collection_name, &entries)?;
             self.db.set_directory_hash(collection_name, &hash)?;
 
             let affected_views = self.view_engine.affected_views(collection_name);
@@ -1886,10 +1941,34 @@ impl Store {
 
     /// Called after any write (insert/update/delete) to a collection.
     /// Updates the directory hash and rebuilds affected views.
-    fn post_write(&self, collection_name: &str) -> Result<()> {
-        // Update directory hash for this collection
-        let hash = self.compute_collection_hash(collection_name)?;
-        self.db.set_directory_hash(collection_name, &hash)?;
+    ///
+    /// `changes` is what the caller knows it did. Given that, the hash is
+    /// updated from the mirrored entry set — no directory sweep. A caller that
+    /// cannot describe its change passes an empty slice and pays the sweep.
+    fn post_write(&self, collection_name: &str, changes: &[EntryChange]) -> Result<()> {
+        if changes.is_empty() {
+            // Caller can't say what moved — restate from disk, and refresh the
+            // mirror so the next described write starts from the truth.
+            let entries = self.collection_entries(collection_name)?;
+            let hash = hash_entries(&entries);
+            self.persist_entries(collection_name, &entries)?;
+            self.db.set_directory_hash(collection_name, &hash)?;
+        } else {
+            for change in changes {
+                match change {
+                    EntryChange::Written { rel, mtime_nanos } => {
+                        self.db
+                            .upsert_collection_entry(collection_name, rel, *mtime_nanos)?
+                    }
+                    EntryChange::Removed { rel } => {
+                        self.db.delete_collection_entry(collection_name, rel)?
+                    }
+                }
+            }
+            let pairs = self.db.collection_entries(collection_name)?;
+            let hash = compute_directory_hash(&pairs);
+            self.db.set_directory_hash(collection_name, &hash)?;
+        }
 
         // Rebuild affected static views
         let affected = self.view_engine.affected_views(collection_name);
@@ -2225,7 +2304,13 @@ impl<'a> Collection<'a> {
                         content,
                     )?;
 
-                    self.store.post_write(&self.name)?;
+                    self.store.post_write(
+                        &self.name,
+                        &[EntryChange::Written {
+                            rel: resolved.clone(),
+                            mtime_nanos: mtime_nanos(&meta),
+                        }],
+                    )?;
                     self.store.subscriptions.notify_collection(
                         &self.name,
                         ChangeEvent::Inserted {
@@ -2261,7 +2346,13 @@ impl<'a> Collection<'a> {
             content,
         )?;
 
-        self.store.post_write(&self.name)?;
+        self.store.post_write(
+            &self.name,
+            &[EntryChange::Written {
+                rel: rel_path.clone(),
+                mtime_nanos: mtime_nanos(&meta),
+            }],
+        )?;
         self.store.subscriptions.notify_collection(
             &self.name,
             ChangeEvent::Inserted {
@@ -2342,7 +2433,19 @@ impl<'a> Collection<'a> {
             content,
         )?;
 
-        self.store.post_write(&self.name)?;
+        // An update can move the file. Both halves are reported, or the entry
+        // set keeps a path that no longer exists and every later boot sees a
+        // hash mismatch it cannot explain.
+        let mut changes = vec![EntryChange::Written {
+            rel: new_rel_path.clone(),
+            mtime_nanos: mtime_nanos(&meta),
+        }];
+        if record.path != new_rel_path {
+            changes.push(EntryChange::Removed {
+                rel: record.path.clone(),
+            });
+        }
+        self.store.post_write(&self.name, &changes)?;
         self.store.subscriptions.notify_collection(
             &self.name,
             ChangeEvent::Updated {
@@ -2416,7 +2519,12 @@ impl<'a> Collection<'a> {
         // Remove from index
         self.store.db.delete_document(&self.name, id)?;
 
-        self.store.post_write(&self.name)?;
+        self.store.post_write(
+            &self.name,
+            &[EntryChange::Removed {
+                rel: record.path.clone(),
+            }],
+        )?;
         self.store.subscriptions.notify_collection(
             &self.name,
             ChangeEvent::Deleted {
