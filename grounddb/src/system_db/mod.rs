@@ -114,6 +114,32 @@ impl SystemDb {
         Ok(ms)
     }
 
+    /// Index one schema field of one collection, by the exact expression a
+    /// view's CTE selects it with: `json_extract(data_json, '$.{field}')`.
+    ///
+    /// Views select from a CTE over `documents`, which SQLite flattens, so a
+    /// `WHERE field = :param` becomes a predicate on that expression and an
+    /// expression index on `(collection, <expr>)` serves it. Without one,
+    /// every parameterised view reads the whole collection. Measured on a
+    /// 31,835-message mail store: a recipient+status lookup went from 855 ms
+    /// to 2.2 ms, a session lookup from 385 ms to 0.1 ms.
+    ///
+    /// `IF NOT EXISTS`, so it is cheap to call on every open. Building it is
+    /// one pass over the collection (2.2 s for the store above).
+    pub fn ensure_field_index(&self, collection: &str, field: &str) -> Result<()> {
+        let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !ident(collection) || !ident(field) {
+            return Err(GroundDbError::Schema(format!(
+                "cannot index '{collection}.{field}': names must be [A-Za-z0-9_]"
+            )));
+        }
+        self.conn().execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS idx_field_{collection}_{field} \
+             ON documents(collection, json_extract(data_json, '$.{field}'));"
+        ))?;
+        Ok(())
+    }
+
     fn initialize_tables(&self) -> Result<()> {
         // First create all tables, then migrate existing ones if needed
         self.conn().execute_batch(
@@ -722,6 +748,41 @@ pub fn compute_directory_hash(entries: &[(String, u64)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The index must serve the SQL a view actually runs: a flattened CTE
+    /// selecting the field through `json_extract`. Checked by query plan, with
+    /// the plan read first WITHOUT the index so the assertion can fail.
+    #[test]
+    fn a_field_index_serves_a_view_shaped_query() {
+        let db = SystemDb::open_in_memory().unwrap();
+        for i in 0..50 {
+            let data: serde_yaml::Value =
+                serde_yaml::from_str(&format!("name: u{i}\nemail: u{i}@test.com")).unwrap();
+            db.upsert_document(&format!("u{i}"), "users", &format!("users/u{i}.md"), &data, None, None, None)
+                .unwrap();
+        }
+        let sql = "EXPLAIN QUERY PLAN WITH users AS (
+                SELECT id, json_extract(data_json, '$.email') AS email
+                FROM documents WHERE collection = 'users')
+            SELECT id FROM users WHERE email = ?1";
+        let plan = |db: &SystemDb| -> String {
+            let conn = db.conn();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let rows = stmt
+                .query_map(["u7@test.com"], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            rows.join(" | ")
+        };
+        assert!(!plan(&db).contains("idx_field_users_email"), "{}", plan(&db));
+
+        db.ensure_field_index("users", "email").unwrap();
+        db.ensure_field_index("users", "email").unwrap(); // idempotent
+        assert!(plan(&db).contains("idx_field_users_email"), "{}", plan(&db));
+
+        assert!(db.ensure_field_index("users", "email'); DROP TABLE documents; --").is_err());
+    }
 
     #[test]
     fn test_create_and_query_document() {

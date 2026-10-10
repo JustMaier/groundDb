@@ -995,6 +995,22 @@ impl Store {
         &self.root
     }
 
+    /// Index a schema field so views that filter on it stop reading the whole
+    /// collection. See [`SystemDb::ensure_field_index`]. Refused for a field
+    /// the collection does not declare, since its expression would match no
+    /// view.
+    pub fn ensure_field_index(&self, collection: &str, field: &str) -> Result<()> {
+        let def = self.schema.collections.get(collection).ok_or_else(|| {
+            GroundDbError::Schema(format!("cannot index unknown collection '{collection}'"))
+        })?;
+        if !def.fields.contains_key(field) {
+            return Err(GroundDbError::Schema(format!(
+                "cannot index '{collection}.{field}': not a declared field"
+            )));
+        }
+        self.db.ensure_field_index(collection, field)
+    }
+
     // ── Typed API (used by codegen-generated StoreExt) ──────────────
 
     /// Get a typed document from a collection.
