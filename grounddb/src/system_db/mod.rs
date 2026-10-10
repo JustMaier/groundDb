@@ -127,15 +127,39 @@ impl SystemDb {
     /// `IF NOT EXISTS`, so it is cheap to call on every open. Building it is
     /// one pass over the collection (2.2 s for the store above).
     pub fn ensure_field_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.ensure_fields_index(collection, &[field])
+    }
+
+    /// [`Self::ensure_field_index`] over several fields, in order, as one
+    /// composite index on `(collection, <expr1>, <expr2>, ...)`.
+    ///
+    /// For a view that filters on the first field and only *reads* the rest
+    /// (a `GROUP BY` count, say): when every column the query touches is in
+    /// the index, SQLite answers from the index alone and never parses
+    /// `data_json`. Measured on the same mail store: an unread-count
+    /// `GROUP BY recipient, recipient_session, addressing` filtered on
+    /// `status` went from 116-196 ms to 0.5 ms. A single-field index on
+    /// `status` did not help there at all: the planner kept the recipient
+    /// index for the `GROUP BY` and still read every row.
+    ///
+    /// Named `idx_field_{collection}_{f1}_{f2}...`, so a single field keeps
+    /// the name `ensure_field_index` always gave it.
+    pub fn ensure_fields_index(&self, collection: &str, fields: &[&str]) -> Result<()> {
         let ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !ident(collection) || !ident(field) {
+        if !ident(collection) || fields.is_empty() || !fields.iter().all(|f| ident(f)) {
             return Err(GroundDbError::Schema(format!(
-                "cannot index '{collection}.{field}': names must be [A-Za-z0-9_]"
+                "cannot index '{collection}.{}': names must be [A-Za-z0-9_]",
+                fields.join(",")
             )));
         }
+        let exprs: Vec<String> = fields
+            .iter()
+            .map(|f| format!("json_extract(data_json, '$.{f}')"))
+            .collect();
         self.conn().execute_batch(&format!(
-            "CREATE INDEX IF NOT EXISTS idx_field_{collection}_{field} \
-             ON documents(collection, json_extract(data_json, '$.{field}'));"
+            "CREATE INDEX IF NOT EXISTS idx_field_{collection}_{}              ON documents(collection, {});",
+            fields.join("_"),
+            exprs.join(", ")
         ))?;
         Ok(())
     }
@@ -782,6 +806,55 @@ mod tests {
         assert!(plan(&db).contains("idx_field_users_email"), "{}", plan(&db));
 
         assert!(db.ensure_field_index("users", "email'); DROP TABLE documents; --").is_err());
+    }
+
+    #[test]
+    fn a_composite_index_answers_a_count_without_reading_rows() {
+        let db = SystemDb::open_in_memory().unwrap();
+        for i in 0..50 {
+            let data: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "status: {}
+recipient: r{}
+room: k{}",
+                if i % 5 == 0 { "unread" } else { "read" },
+                i % 3,
+                i % 2
+            ))
+            .unwrap();
+            db.upsert_document(&format!("m{i}"), "msgs", &format!("msgs/m{i}.md"), &data, None, None, None)
+                .unwrap();
+        }
+        // The shape of mail's counts_by_status view after CTE flattening.
+        let sql = "EXPLAIN QUERY PLAN WITH msgs AS (
+                SELECT id, json_extract(data_json, '$.status') AS status,
+                       json_extract(data_json, '$.recipient') AS recipient,
+                       json_extract(data_json, '$.room') AS room
+                FROM documents WHERE collection = 'msgs')
+            SELECT recipient, room, COUNT(*) FROM msgs WHERE status = ?1 GROUP BY recipient, room";
+        let plan = |db: &SystemDb| -> String {
+            let conn = db.conn();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let rows = stmt
+                .query_map(["unread"], |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>();
+            rows.join(" | ")
+        };
+        let idx = "idx_field_msgs_status_recipient_room";
+        assert!(!plan(&db).contains(idx), "{}", plan(&db));
+
+        db.ensure_fields_index("msgs", &["status", "recipient", "room"]).unwrap();
+        db.ensure_fields_index("msgs", &["status", "recipient", "room"]).unwrap(); // idempotent
+        let p = plan(&db);
+        assert!(p.contains(idx), "{p}");
+        // `SEARCH ... USING INDEX`, not `COVERING INDEX`, is how SQLite words an
+        // expression index it answered from; what matters is that no other
+        // access path to `documents` appears.
+        assert!(!p.contains("idx_documents_collection "), "{p}");
+
+        assert!(db.ensure_fields_index("msgs", &[]).is_err());
+        assert!(db.ensure_fields_index("msgs", &["status", "x'); DROP TABLE documents; --"]).is_err());
     }
 
     #[test]

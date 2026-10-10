@@ -1000,15 +1000,24 @@ impl Store {
     /// the collection does not declare, since its expression would match no
     /// view.
     pub fn ensure_field_index(&self, collection: &str, field: &str) -> Result<()> {
+        self.ensure_fields_index(collection, &[field])
+    }
+
+    /// A composite index over several schema fields, in order. See
+    /// [`SystemDb::ensure_fields_index`]: it lets a view that filters on the
+    /// first field and only reads the others be answered from the index
+    /// without parsing a single row. Refused for any field the collection
+    /// does not declare.
+    pub fn ensure_fields_index(&self, collection: &str, fields: &[&str]) -> Result<()> {
         let def = self.schema.collections.get(collection).ok_or_else(|| {
             GroundDbError::Schema(format!("cannot index unknown collection '{collection}'"))
         })?;
-        if !def.fields.contains_key(field) {
+        if let Some(field) = fields.iter().find(|f| !def.fields.contains_key(**f)) {
             return Err(GroundDbError::Schema(format!(
                 "cannot index '{collection}.{field}': not a declared field"
             )));
         }
-        self.db.ensure_field_index(collection, field)
+        self.db.ensure_fields_index(collection, fields)
     }
 
     // ── Typed API (used by codegen-generated StoreExt) ──────────────
