@@ -54,3 +54,4 @@ pub use schema::SchemaDefinition;
 pub use store::{Store, Collection, Batch, SubscriptionId, ChangeEvent};
 pub use document::Document;
 pub use view::ViewEngine;
+pub use system_db::{FindQuery, FoundDocument};

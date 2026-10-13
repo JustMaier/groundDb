@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+mod find;
+pub use find::{FindQuery, FoundDocument};
+
 /// How long a connection retries a lock held by another connection before
 /// giving up with `SQLITE_BUSY`.
 ///

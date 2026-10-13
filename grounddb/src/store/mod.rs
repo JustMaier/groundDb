@@ -1307,6 +1307,39 @@ impl Store {
         col.delete(id)
     }
 
+    /// Rows of `collection` matching `q` (equality filters, one sort, a
+    /// keyset cursor, a limit), read from the index, not the files. Each row is
+    /// `{ id, ...fields }`. See [`crate::system_db::FindQuery`]; index the
+    /// fields you filter and sort on with [`Self::ensure_fields_index`].
+    pub fn find_dynamic(&self, collection: &str, q: &crate::system_db::FindQuery) -> Result<Vec<serde_json::Value>> {
+        self.collection(collection)?;
+        Ok(self
+            .db
+            .find_documents(collection, q)?
+            .into_iter()
+            .map(|d| {
+                let mut obj = match d.data {
+                    serde_json::Value::Object(m) => m,
+                    _ => serde_json::Map::new(),
+                };
+                obj.insert("id".into(), serde_json::Value::String(d.id));
+                serde_json::Value::Object(obj)
+            })
+            .collect())
+    }
+
+    /// How many rows of `collection` match `q.filters`.
+    pub fn count_dynamic(&self, collection: &str, q: &crate::system_db::FindQuery) -> Result<u64> {
+        self.collection(collection)?;
+        self.db.count_documents(collection, q)
+    }
+
+    /// SQLite's plan for [`Self::find_dynamic`], one line per step.
+    pub fn explain_find(&self, collection: &str, q: &crate::system_db::FindQuery) -> Result<Vec<String>> {
+        self.collection(collection)?;
+        self.db.explain_find(collection, q)
+    }
+
     /// Read a static view by name.
     pub fn view_dynamic(&self, name: &str) -> Result<serde_json::Value> {
         // Check view exists
