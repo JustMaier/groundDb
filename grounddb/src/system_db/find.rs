@@ -93,6 +93,16 @@ impl SystemDb {
         Ok(n.max(0) as u64)
     }
 
+    /// Refresh SQLite's statistics (`ANALYZE`). Without them the planner
+    /// guesses between field indexes and can pick the one that matches the
+    /// sort instead of the selective filter: measured on 100k rows, a
+    /// `list = ? AND done = ? ORDER BY due` read every row in due order.
+    /// Run it after building indexes or after a large load.
+    pub fn analyze(&self) -> Result<()> {
+        self.conn().execute_batch("ANALYZE")?;
+        Ok(())
+    }
+
     /// The plan SQLite picks for `q`, one line per step (`EXPLAIN QUERY PLAN`).
     /// For tests and diagnostics: it is how a caller proves a filter is served
     /// by an index rather than a scan.

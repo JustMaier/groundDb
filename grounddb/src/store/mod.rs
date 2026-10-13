@@ -1334,6 +1334,12 @@ impl Store {
         self.db.count_documents(collection, q)
     }
 
+    /// Refresh the index statistics the planner uses (`ANALYZE`). See
+    /// [`crate::system_db::SystemDb::analyze`].
+    pub fn analyze(&self) -> Result<()> {
+        self.db.analyze()
+    }
+
     /// SQLite's plan for [`Self::find_dynamic`], one line per step.
     pub fn explain_find(&self, collection: &str, q: &crate::system_db::FindQuery) -> Result<Vec<String>> {
         self.collection(collection)?;
