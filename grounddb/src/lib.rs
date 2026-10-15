@@ -40,6 +40,7 @@
 pub mod schema;
 pub mod path_template;
 pub mod document;
+pub mod jsonl;
 pub mod system_db;
 pub mod store;
 pub mod validation;
@@ -54,4 +55,4 @@ pub use schema::SchemaDefinition;
 pub use store::{Store, Collection, Batch, SubscriptionId, ChangeEvent};
 pub use document::Document;
 pub use view::ViewEngine;
-pub use system_db::{FindQuery, FoundDocument};
+pub use system_db::{FindQuery, FoundDocument, FoundRecord, RecordQuery, RecordRange};

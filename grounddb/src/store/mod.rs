@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
 
+mod records;
+
 /// Unique subscription identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(u64);
@@ -403,6 +405,8 @@ pub struct Store {
     /// (U1d). For these, id recovery from a filename is untrusted: reindex /
     /// rebuild / reconcile are refused rather than risk silent wrong ids.
     mis_splittable: HashSet<String>,
+    /// Serialises appends to and indexing of record (`.jsonl`) files.
+    record_lock: Mutex<()>,
 }
 
 impl Store {
@@ -468,6 +472,10 @@ impl Store {
                 Some(d) => d,
                 None => continue,
             };
+            // Record ids come from byte offsets, never from filenames.
+            if def.file_extension() == "jsonl" {
+                continue;
+            }
             let reason = match template_extraction_hazard(template, def) {
                 Some(r) => r,
                 None => continue,
@@ -511,6 +519,7 @@ impl Store {
             _watcher: Mutex::new(None),
             self_writes: SelfWriteLedger::default(),
             mis_splittable,
+            record_lock: Mutex::new(()),
         };
 
         store.boot()?;
@@ -597,7 +606,9 @@ impl Store {
                     }
                     self.db.record_migration(&m.describe())?;
                 }
-                migration::SchemaMigration::FieldAdded { collection, field, has_default: true, .. } => {
+                migration::SchemaMigration::FieldAdded { collection, field, has_default: true, .. }
+                    if !self.is_record_collection(collection) =>
+                {
                     // Backfill default value to documents missing this field
                     let field_def = &self.schema.collections[collection].fields[field];
                     if let Some(default_val) = &field_def.default {
@@ -667,6 +678,10 @@ impl Store {
     /// Full scan: read all documents in all collections, populate the index
     fn full_scan(&self) -> Result<()> {
         for (name, _collection) in &self.schema.collections {
+            if self.is_record_collection(name) {
+                self.sync_record_collection(name, false)?;
+                continue;
+            }
             // Skip mis-splittable collections rather than reindex them with
             // wrong ids (U1d). Boot must still succeed — the invariant is "no
             // silent wrong ids", not "no store opens". The open-time warning
@@ -699,6 +714,10 @@ impl Store {
         for (name, _collection) in &self.schema.collections {
             if self.mis_splittable.contains(name) {
                 continue; // see full_scan — reindex refused for these
+            }
+            if self.is_record_collection(name) {
+                self.sync_record_collection(name, false)?;
+                continue;
             }
             let base_dir = self.root.join(self.path_templates[name].base_directory());
             if !base_dir.exists() {
@@ -1486,6 +1505,9 @@ impl Store {
         let mut results = serde_json::Map::new();
 
         for (name, collection_def) in &self.schema.collections {
+            if self.is_record_collection(name) {
+                continue;
+            }
             let col = self.collection(name)?;
             let docs = col.list()?;
             let mut col_results = Vec::new();
@@ -1564,6 +1586,7 @@ impl Store {
     /// completes for the safe collections rather than aborting on one bad one.
     pub fn rebuild(&self, collection: Option<&str>) -> Result<()> {
         match collection {
+            Some(name) if self.is_record_collection(name) => self.sync_record_collection(name, true),
             Some(name) => {
                 self.scan_collection(name)?;
                 // Rebuild views affected by this collection
@@ -1680,7 +1703,15 @@ impl Store {
         let mut affected_collections = std::collections::HashSet::new();
         for event in &events {
             if let Some(collection_name) = self.collection_for_path(&event.path) {
-                match self.process_single_watcher_event(&collection_name, event) {
+                let is_records = self.is_record_collection(&collection_name);
+                let outcome = if is_records {
+                    // Record collections have no views and no entry mirror:
+                    // index the file and notify, nothing more.
+                    self.apply_record_event(&collection_name, event).map(|_| false)
+                } else {
+                    self.process_single_watcher_event(&collection_name, event)
+                };
+                match outcome {
                     // Only a real index change warrants a view rebuild + notify.
                     // A suppressed own-write echo (or benign/stale no-op) returns
                     // false, so it no longer triggers a redundant view rebuild
@@ -2257,8 +2288,21 @@ impl<'a> Collection<'a> {
         &self.store.path_templates[&self.name]
     }
 
+    /// Record (`.jsonl`) collections hold many records per file and are
+    /// append-only, so the one-document-per-file calls do not apply.
+    fn refuse_records(&self, op: &str) -> Result<()> {
+        if self.store.is_record_collection(&self.name) {
+            return Err(GroundDbError::Other(format!(
+                "Collection '{}' is a record (.jsonl) collection: {op} is not supported.                  Use append_record, find_records or get_record; to change a record, append an edit record",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// Get a document by ID
     pub fn get(&self, id: &str) -> Result<Document<serde_yaml::Value>> {
+        self.refuse_records("get")?;
         let record = self
             .store
             .db
@@ -2278,6 +2322,7 @@ impl<'a> Collection<'a> {
 
     /// List all documents in this collection
     pub fn list(&self) -> Result<Vec<Document<serde_yaml::Value>>> {
+        self.refuse_records("list")?;
         let records = self.store.db.list_documents(&self.name)?;
         let mut docs = Vec::new();
 
@@ -2306,6 +2351,7 @@ impl<'a> Collection<'a> {
         mut data: serde_yaml::Value,
         content: Option<&str>,
     ) -> Result<String> {
+        self.refuse_records("insert")?;
         let definition = self.definition();
 
         if definition.readonly {
@@ -2434,6 +2480,7 @@ impl<'a> Collection<'a> {
         mut data: serde_yaml::Value,
         content: Option<&str>,
     ) -> Result<()> {
+        self.refuse_records("update")?;
         let definition = self.definition();
 
         if definition.readonly {
@@ -2528,6 +2575,7 @@ impl<'a> Collection<'a> {
         partial: serde_yaml::Value,
         content: Option<&str>,
     ) -> Result<()> {
+        self.refuse_records("update_partial")?;
         // Read existing document
         let existing = self.get(id)?;
         let mut merged = existing.data;
@@ -2551,6 +2599,7 @@ impl<'a> Collection<'a> {
 
     /// Delete a document by ID. Enforces referential integrity.
     pub fn delete(&self, id: &str) -> Result<()> {
+        self.refuse_records("delete")?;
         let definition = self.definition();
 
         if definition.readonly {

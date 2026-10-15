@@ -7,6 +7,8 @@ use std::sync::Mutex;
 
 mod find;
 pub use find::{FindQuery, FoundDocument};
+mod records;
+pub use records::{parse_record_id, record_id, FoundRecord, RecordFile, RecordQuery, RecordRange};
 
 /// How long a connection retries a lock held by another connection before
 /// giving up with `SQLITE_BUSY`.
@@ -235,6 +237,7 @@ impl SystemDb {
             );
             "
         )?;
+        self.initialize_record_tables()?;
         // Migrate existing documents table: add columns if missing
         self.migrate_documents_table()?;
         Ok(())

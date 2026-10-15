@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Append-only JSONL record collections.** A collection whose path ends in
+  `.jsonl` is indexed one record per line in a new `records` table (the
+  `documents` table and every markdown path are untouched). `append_record` /
+  `append_record_to` write one line with a single write + `sync_data`, and
+  terminate a torn last line left by a crash instead of gluing onto it.
+  `find_records` / `count_records` read newest first with equality filters,
+  ranges and an id cursor; `ensure_record_index` serves a filter in id order;
+  `tail_records` and `jsonl::ReverseLines` read a file backwards from EOF.
+  Boot and the watcher index a file from where its index stopped, and reindex
+  a file that shrank or was replaced. Design: `docs/jsonl-collections.md`.
+
 ## [1.3.0] - 2026-08-14
 
 Boot and write cost no longer scale with how much data a collection already

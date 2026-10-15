@@ -40,7 +40,7 @@ pub struct FoundDocument {
     pub data: serde_json::Value,
 }
 
-fn ident(s: &str) -> bool {
+pub(crate) fn ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -50,7 +50,7 @@ pub(crate) fn field_expr(field: &str) -> String {
     format!("json_extract(data_json, '$.{field}')")
 }
 
-fn sql_value(field: &str, v: &serde_json::Value) -> Result<Option<SqlValue>> {
+pub(crate) fn sql_value(field: &str, v: &serde_json::Value) -> Result<Option<SqlValue>> {
     Ok(match v {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(b) => Some(SqlValue::Integer(*b as i64)),
