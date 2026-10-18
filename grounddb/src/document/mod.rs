@@ -143,14 +143,74 @@ pub fn write_document(
     let parent = path.parent().unwrap_or(Path::new("."));
     let temp = tempfile::NamedTempFile::new_in(parent)?;
     std::fs::write(temp.path(), &serialized)?;
-    temp.persist(path).map_err(|e| {
-        GroundDbError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to persist temp file: {e}"),
-        ))
-    })?;
+    persist_with_retry(temp, path)
+}
 
-    Ok(())
+/// Rename attempts before giving up on a target someone else is holding.
+const PERSIST_ATTEMPTS: u32 = 5;
+
+/// Rename the finished temp file over `path`, retrying while the target is
+/// held open by another process.
+///
+/// On Windows a rename over a file fails with Access is denied (os error 5)
+/// while any handle on it was opened without FILE_SHARE_DELETE: an indexer,
+/// an antivirus scan, a backup, a reader. The holder usually lets go within
+/// milliseconds, so giving up on the first error loses a write that would
+/// have landed a moment later. agent-server measured 154 of these in August
+/// and 8 in a single second on 2026-10-18. Only the "someone has it open"
+/// errors are retried, with 50, 100, 200, 400 ms between tries (750 ms in
+/// all); anything else fails at once. On final failure the temp file is
+/// dropped, which deletes it, so no orphan is left beside the target.
+fn persist_with_retry(mut temp: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match temp.persist(path) {
+            Ok(_) => {
+                if attempt > 1 {
+                    warn(&format!(
+                        "persist {} landed on attempt {attempt}/{PERSIST_ATTEMPTS} (target was held open)",
+                        path.display()
+                    ));
+                }
+                return Ok(());
+            }
+            Err(e) if attempt < PERSIST_ATTEMPTS && is_held_open(&e.error) => {
+                std::thread::sleep(std::time::Duration::from_millis(50 << (attempt - 1)));
+                temp = e.file;
+                attempt += 1;
+            }
+            Err(e) => {
+                if attempt > 1 {
+                    warn(&format!(
+                        "persist {} FAILED after {attempt} attempts: {}",
+                        path.display(),
+                        e.error
+                    ));
+                }
+                return Err(GroundDbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to persist temp file: {} (after {attempt} attempts)", e.error),
+                )));
+            }
+        }
+    }
+}
+
+/// Errors that mean another handle has the target open, which clear on their
+/// own: Access is denied (5), sharing violation (32), lock violation (33).
+fn is_held_open(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(32 | 33))
+}
+
+/// Warn through `log` when the host installed a logger, otherwise on stderr.
+/// Several hosts (agent-server among them) install none, and a retry nobody
+/// can see is how this failure went unmeasured for two months.
+fn warn(msg: &str) {
+    if log::log_enabled!(log::Level::Warn) {
+        log::warn!("[grounddb] {msg}");
+    } else {
+        eprintln!("[grounddb] {msg}");
+    }
 }
 
 /// Delete a document from disk.
@@ -379,5 +439,82 @@ mod tests {
 
         let doc = read_document(&to).unwrap();
         assert!(doc.content.unwrap().contains("body"));
+    }
+
+    /// Open `path` the way a scanner or reader does that forgot
+    /// FILE_SHARE_DELETE: reads and writes are shared, a rename over it is not.
+    /// While this handle lives, replacing the file fails with Access is denied.
+    #[cfg(windows)]
+    fn hold_without_share_delete(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn stray_temp_files(dir: &Path, keep: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p != keep)
+            .collect()
+    }
+
+    /// The case that loses data today: a holder lets go a moment after the
+    /// save. The write must land, with the new content, and leave no orphan.
+    #[cfg(windows)]
+    #[test]
+    fn test_write_survives_a_briefly_held_target() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("held.md");
+        let mut data = serde_yaml::Mapping::new();
+        data.insert("v".into(), 1.into());
+        write_document(&path, &serde_yaml::Value::Mapping(data.clone()), None).unwrap();
+
+        let handle = hold_without_share_delete(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(handle);
+        });
+
+        data.insert("v".into(), 2.into());
+        let result = write_document(&path, &serde_yaml::Value::Mapping(data), None);
+        release.join().unwrap();
+
+        result.expect("a save over a briefly held file must retry and land");
+        let doc = read_document(&path).unwrap();
+        assert_eq!(doc.data["v"], serde_yaml::Value::from(2));
+        assert!(stray_temp_files(tmp.path(), &path).is_empty());
+    }
+
+    /// The bound: a holder that never lets go still fails, in bounded time,
+    /// and the temp file is cleaned up rather than left beside the target.
+    #[cfg(windows)]
+    #[test]
+    fn test_write_gives_up_on_a_target_held_forever() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("held.md");
+        let mut data = serde_yaml::Mapping::new();
+        data.insert("v".into(), 1.into());
+        write_document(&path, &serde_yaml::Value::Mapping(data.clone()), None).unwrap();
+
+        let _handle = hold_without_share_delete(&path);
+        data.insert("v".into(), 2.into());
+        let started = std::time::Instant::now();
+        let err = write_document(&path, &serde_yaml::Value::Mapping(data), None)
+            .expect_err("a file held for the whole bound must still fail");
+        let took = started.elapsed();
+
+        assert!(err.to_string().contains("Failed to persist temp file"), "{err}");
+        assert!(took < std::time::Duration::from_millis(2000), "took {took:?}");
+        drop(_handle);
+        assert!(stray_temp_files(tmp.path(), &path).is_empty());
+        let doc = read_document(&path).unwrap();
+        assert_eq!(doc.data["v"], serde_yaml::Value::from(1));
     }
 }
