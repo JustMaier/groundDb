@@ -827,6 +827,15 @@ impl Store {
     /// Read one file and write its index row.
     fn index_entry(&self, name: &str, entry: &ScanEntry) -> Result<()> {
         let doc = document::read_document(&entry.abs)?;
+        // A file zero-filled by a crash has no front matter and a body of
+        // NULs. Indexing it would file an empty row under its id, possibly
+        // over a good copy of the same id at another path (a rollback can
+        // leave `pending/<id>.md` zeroed beside `answered/<id>.md`). Skip it,
+        // and say so: the file stays on disk for whoever repairs it.
+        if doc.content.as_deref().is_some_and(|c| c.contains('\0')) {
+            document::warn(&format!("skipped zero-filled file {} (crash damage?): not indexed", entry.abs.display()));
+            return Ok(());
+        }
 
         // Derive the id by reverse-mapping the path through the template
         // so a decorated stem like `{id}-{title}.md` recovers the stored

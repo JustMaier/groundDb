@@ -35,6 +35,40 @@ fn update_partial_refuses_a_zero_filled_file_and_leaves_it_alone() {
     assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; len], "the damaged file is left as it was");
 }
 
+const BY_STATUS: &str = r#"collections:
+  asks:
+    path: "asks/{status}/{id}.md"
+    fields:
+      summary: { type: string, required: true }
+      status: { type: string, default: "pending" }
+    content: true
+"#;
+
+/// After a rollback, a zero-filled `pending/<id>.md` can sit beside the good
+/// `answered/<id>.md`. A rescan must not index the zeroed one over it.
+#[test]
+fn a_rescan_skips_a_zero_filled_file_and_keeps_the_good_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("schema.yaml"), BY_STATUS).unwrap();
+    {
+        let store = Store::open(&dir.path().to_string_lossy()).unwrap();
+        store.insert_dynamic("asks", serde_json::json!({ "id": "a1", "summary": "ship it?" }), Some("the body")).unwrap();
+        store.update_partial_dynamic("asks", "a1", serde_json::json!({ "status": "answered" })).unwrap();
+    }
+    let good = dir.path().join("asks").join("answered").join("a1.md");
+    assert!(good.exists(), "the answer moved the file to answered/");
+    let zeroed = dir.path().join("asks").join("pending").join("a1.md");
+    std::fs::create_dir_all(zeroed.parent().unwrap()).unwrap();
+    std::fs::write(&zeroed, vec![0u8; 300]).unwrap();
+
+    // Reopening rescans the changed directory.
+    let store = Store::open(&dir.path().to_string_lossy()).unwrap();
+    let doc = store.get_dynamic("asks", "a1").unwrap();
+    assert_eq!(doc["summary"], "ship it?", "the good copy is what the index serves");
+    assert_eq!(doc["status"], "answered");
+    assert!(zeroed.exists(), "the damaged file is left on disk");
+}
+
 #[test]
 fn update_partial_still_merges_onto_a_whole_file() {
     let dir = tempfile::tempdir().unwrap();

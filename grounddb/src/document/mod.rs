@@ -210,7 +210,7 @@ fn is_held_open(e: &std::io::Error) -> bool {
 /// Warn through `log` when the host installed a logger, otherwise on stderr.
 /// Several hosts (agent-server among them) install none, and a retry nobody
 /// can see is how this failure went unmeasured for two months.
-fn warn(msg: &str) {
+pub(crate) fn warn(msg: &str) {
     if log::log_enabled!(log::Level::Warn) {
         log::warn!("[grounddb] {msg}");
     } else {
