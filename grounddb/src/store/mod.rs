@@ -832,7 +832,7 @@ impl Store {
         // over a good copy of the same id at another path (a rollback can
         // leave `pending/<id>.md` zeroed beside `answered/<id>.md`). Skip it,
         // and say so: the file stays on disk for whoever repairs it.
-        if doc.content.as_deref().is_some_and(|c| c.contains('\0')) {
+        if document::is_zero_filled(&doc) {
             document::warn(&format!("skipped zero-filled file {} (crash damage?): not indexed", entry.abs.display()));
             return Ok(());
         }
@@ -2591,7 +2591,7 @@ impl<'a> Collection<'a> {
         // of NULs. Merging onto that writes the patch over an empty base and
         // the defaults, and every other field is lost for good (an answered
         // ask, 2026-10-19). Refuse, so the loss is an error, not a rewrite.
-        if existing.content.as_deref().is_some_and(|c| c.contains('\0')) || !existing.data.is_mapping() {
+        if document::is_zero_filled(&existing) || !existing.data.is_mapping() {
             return Err(GroundDbError::Other(format!(
                 "refusing to update {}/{id}: the file on disk is unreadable (zero-filled or no front matter)",
                 self.name

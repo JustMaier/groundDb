@@ -69,6 +69,30 @@ fn a_rescan_skips_a_zero_filled_file_and_keeps_the_good_copy() {
     assert!(zeroed.exists(), "the damaged file is left on disk");
 }
 
+/// A real document may quote a NUL in its body (a mail citing `"\x00"`,
+/// 2026-10-20). Only a file with no front matter and nothing but NULs is
+/// crash damage: this one must index on a rescan and accept updates.
+#[test]
+fn a_whole_file_with_a_nul_in_its_body_indexes_and_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("schema.yaml"), SCHEMA).unwrap();
+    let body = "const SEP = \"\0\";\nthe rest of the mail";
+    {
+        let store = Store::open(&dir.path().to_string_lossy()).unwrap();
+        store.insert_dynamic("asks", serde_json::json!({ "id": "a1", "summary": "ship it?" }), Some(body)).unwrap();
+    }
+    // Rewrite the same bytes so the reopen rescans the file.
+    let path = dir.path().join("asks").join("a1.md");
+    let raw = std::fs::read(&path).unwrap();
+    assert!(raw.contains(&0u8), "the body really carries a NUL");
+    std::fs::write(&path, &raw).unwrap();
+
+    let store = Store::open(&dir.path().to_string_lossy()).unwrap();
+    assert_eq!(store.get_dynamic("asks", "a1").unwrap()["summary"], "ship it?", "indexed despite the NUL");
+    store.update_partial_dynamic("asks", "a1", serde_json::json!({ "status": "answered" })).unwrap();
+    assert_eq!(store.get_dynamic("asks", "a1").unwrap()["status"], "answered");
+}
+
 #[test]
 fn update_partial_still_merges_onto_a_whole_file() {
     let dir = tempfile::tempdir().unwrap();

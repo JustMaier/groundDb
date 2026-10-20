@@ -46,6 +46,18 @@ pub fn read_document(path: &Path) -> Result<Document<serde_yaml::Value>> {
     })
 }
 
+/// A document a crash zero-filled: no front matter, and a body of nothing
+/// but NULs (and whitespace). A real document can quote a NUL in its body
+/// (a mail citing `"\x00"`), so a NUL alone proves nothing.
+pub fn is_zero_filled(doc: &Document<serde_yaml::Value>) -> bool {
+    let no_front_matter = doc.data.as_mapping().is_none_or(|m| m.is_empty());
+    no_front_matter
+        && doc
+            .content
+            .as_deref()
+            .is_some_and(|c| c.contains('\0') && c.chars().all(|ch| ch == '\0' || ch.is_whitespace()))
+}
+
 /// Parse a markdown string into front matter data and optional body content.
 pub fn parse_front_matter(raw: &str) -> Result<(serde_yaml::Value, Option<String>)> {
     let trimmed = raw.trim_start();
