@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-20
+
 ### Added
+- **`Store::ensure_field_index` / `ensure_fields_index`.** Expression indexes
+  over view-filtered fields, single or composite, so a parameterised view
+  filter and an index-only GROUP BY stop reading the whole collection
+  (recipient + status lookup on a 31.8k-document store: 855 ms to 2.2 ms).
+- **`find_dynamic`, `count_dynamic`, `explain_find`.** Run-time equality
+  filters bound by JSON type, one sort with the id as tie-break, and a keyset
+  cursor, served by the same expressions `ensure_fields_index` indexes.
+- **`Store::analyze`.** Runs `ANALYZE` so the planner picks the right field
+  index; examples `find_bench` and `open_check`.
 - **Append-only JSONL record collections.** A collection whose path ends in
   `.jsonl` is indexed one record per line in a new `records` table (the
   `documents` table and every markdown path are untouched). `append_record` /
@@ -18,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tail_records` and `jsonl::ReverseLines` read a file backwards from EOF.
   Boot and the watcher index a file from where its index stopped, and reindex
   a file that shrank or was replaced. Design: `docs/jsonl-collections.md`.
+
+### Fixed
+- **Writes survive a hard crash.** `write_document` syncs the temp file
+  before renaming it over the document; a crash used to leave the rename
+  without the data, a zero-filled file.
+- **A zero-filled file is never merged onto or indexed.** `update_partial`
+  refuses a file with no front matter and an all-NUL body instead of
+  rewriting it from defaults, and a rescan skips such a file with a warning.
+  A real NUL inside a body is not treated as damage.
+- **Rename retried on Windows.** Replacing a document while another handle
+  holds it (indexer, antivirus, backup) is retried for up to 750 ms instead
+  of losing the write.
 
 ## [1.3.0] - 2026-08-14
 
