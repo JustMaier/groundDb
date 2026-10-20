@@ -139,10 +139,15 @@ pub fn write_document(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Atomic write: write to temp file, then rename
+    // Atomic and durable: write a temp file, flush it to disk, then rename.
+    // Without the flush, a hard power loss can keep the rename (metadata is
+    // journaled) and lose the data (still in the cache): the file survives at
+    // full length, zero-filled, and reads as a document with no front matter.
+    // A crash on 2026-10-19 lost seven files that way.
     let parent = path.parent().unwrap_or(Path::new("."));
-    let temp = tempfile::NamedTempFile::new_in(parent)?;
-    std::fs::write(temp.path(), &serialized)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut temp, serialized.as_bytes())?;
+    temp.as_file().sync_all()?;
     persist_with_retry(temp, path)
 }
 

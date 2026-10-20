@@ -2578,6 +2578,16 @@ impl<'a> Collection<'a> {
         self.refuse_records("update_partial")?;
         // Read existing document
         let existing = self.get(id)?;
+        // A file zero-filled by a crash parses as no front matter and a body
+        // of NULs. Merging onto that writes the patch over an empty base and
+        // the defaults, and every other field is lost for good (an answered
+        // ask, 2026-10-19). Refuse, so the loss is an error, not a rewrite.
+        if existing.content.as_deref().is_some_and(|c| c.contains('\0')) || !existing.data.is_mapping() {
+            return Err(GroundDbError::Other(format!(
+                "refusing to update {}/{id}: the file on disk is unreadable (zero-filled or no front matter)",
+                self.name
+            )));
+        }
         let mut merged = existing.data;
 
         // Merge partial data into existing
